@@ -412,8 +412,9 @@ def run_analysis(raw_bytes, filename):
     st.download_button(
         label="Download plot as PNG",
         data=buf,
-        file_name="diffusion_analysis.png",
+        file_name=f"diffusion_analysis_{filename}.png",
         mime="image/png",
+        key=f"download_plot_{filename}",
     )
     plt.close(fig)
 
