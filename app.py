@@ -14,7 +14,7 @@ import io
 import csv
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, minimize
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -180,6 +180,191 @@ def method_pde(x, data, times, D_bounds=(1e-6, 5e-2), n_bc=10):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# METHOD 3: GAUSSIAN + k_loss FIT  (D_eff with source depletion)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _gaussian_model(x, t, A, x0, D_eff, k_loss, t0):
+    """Gaussian pulse with exponential decay:
+    u(x,t) = A / sqrt(t+t0) * exp(-(x-x0)^2 / (4*D_eff*(t+t0))) * exp(-k_loss*t)
+    """
+    tau = t + t0
+    return (A / np.sqrt(tau)) * np.exp(-(x - x0) ** 2 / (4 * D_eff * tau)) * np.exp(-k_loss * t)
+
+
+def method_gaussian_kloss(x, data, times, n_edge=15):
+    """Fit the Gaussian+k_loss model to the excess profiles.
+
+    Model: u(x,t) = A/sqrt(t+t0) * exp(-(x-x0)^2 / (4*D_eff*(t+t0))) * exp(-k_loss*t)
+
+    Returns dict with D_eff, k_loss, fit quality, and simulated field.
+    """
+    bl = 0.5 * (data[:n_edge, 0].mean() + data[-n_edge:, 0].mean())
+    excess = data - bl
+
+    # Initial guesses from the data
+    peak_idx = np.argmax(excess[:, 0])
+    x0_init = x[peak_idx]
+    A_init = excess[peak_idx, 0] * np.sqrt(1.0)
+
+    # Estimate initial D from early variance
+    ex_pos = np.maximum(excess, 0)
+    M0 = np.sum(ex_pos[:, 0]) * np.median(np.diff(x))
+    if M0 > 0:
+        xbar = np.sum(ex_pos[:, 0] * x) * np.median(np.diff(x)) / M0
+        sig2_0 = np.sum(ex_pos[:, 0] * (x - xbar) ** 2) * np.median(np.diff(x)) / M0
+    else:
+        xbar, sig2_0 = x0_init, 1.0
+
+    D_init = 1e-4
+    k_init = 1e-4
+    t0_init = max(sig2_0 / (4 * D_init), 1.0)
+
+    def objective(params):
+        A, x0, log_D, log_k, log_t0 = params
+        D_eff = np.exp(log_D)
+        k_loss = np.exp(log_k)
+        t0 = np.exp(log_t0)
+        residual = 0.0
+        for ti in range(len(times)):
+            t = times[ti]
+            model = _gaussian_model(x, t, A, x0, D_eff, k_loss, t0)
+            residual += np.sum((model - excess[:, ti]) ** 2)
+        return residual
+
+    p0 = [A_init, x0_init, np.log(D_init), np.log(k_init), np.log(t0_init)]
+
+    result = minimize(objective, p0, method="Nelder-Mead",
+                      options={"maxiter": 10000, "xatol": 1e-10, "fatol": 1e-10})
+
+    A_fit, x0_fit = result.x[0], result.x[1]
+    D_eff = np.exp(result.x[2])
+    k_loss = np.exp(result.x[3])
+    t0_fit = np.exp(result.x[4])
+
+    # Build simulated field
+    C_sim = np.zeros_like(data)
+    for ti in range(len(times)):
+        C_sim[:, ti] = _gaussian_model(x, times[ti], A_fit, x0_fit, D_eff, k_loss, t0_fit) + bl
+
+    # RMSE
+    n_pts = excess.size
+    rmse = np.sqrt(result.fun / n_pts)
+
+    # Characteristic diffusion length at each timestep
+    L_d = np.sqrt(2 * D_eff * (times + t0_fit))
+
+    return {
+        "D_eff": D_eff,
+        "k_loss": k_loss,
+        "t0": t0_fit,
+        "A": A_fit,
+        "x0": x0_fit,
+        "RMSE": rmse,
+        "C_sim": C_sim,
+        "L_d": L_d,
+        "baseline": bl,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# METHOD 4: PDE + k_loss (REACTION-DIFFUSION, CRANK-NICOLSON)
+# ═══════════════════════════════════════════════════════════════════════
+
+def solve_CN_kloss(C0, x, times, D, k_loss, bc_left, bc_right):
+    """Crank-Nicolson solver for 1D diffusion with first-order loss and Dirichlet BCs.
+
+    du/dt = D * d²u/dx² - k_loss * u
+    """
+    N = len(x)
+    dx = np.median(np.diff(x))
+    C_all = np.zeros((N, len(times)))
+    C_all[:, 0] = C0.copy()
+
+    for n in range(len(times) - 1):
+        dt = times[n + 1] - times[n]
+        r = D * dt / (2.0 * dx ** 2)
+        k_half = k_loss * dt / 2.0
+        Ni = N - 2
+        C_old = C_all[:, n]
+
+        # RHS: explicit half-step (diffusion + reaction)
+        rhs = np.zeros(Ni)
+        for i in range(Ni):
+            j = i + 1
+            rhs[i] = (r * C_old[j - 1]
+                       + (1 - 2 * r - k_half) * C_old[j]
+                       + r * C_old[j + 1])
+        rhs[0] += r * bc_left[n + 1]
+        rhs[-1] += r * bc_right[n + 1]
+
+        # LHS: implicit half-step tridiagonal coefficients
+        a_val = -r
+        b_val = 1 + 2 * r + k_half
+        c_val = -r
+
+        # Thomas algorithm
+        cp = np.zeros(Ni)
+        dp = np.zeros(Ni)
+        cp[0] = c_val / b_val
+        dp[0] = rhs[0] / b_val
+        for i in range(1, Ni):
+            denom = b_val - a_val * cp[i - 1]
+            cp[i] = c_val / denom if i < Ni - 1 else 0
+            dp[i] = (rhs[i] - a_val * dp[i - 1]) / denom
+
+        C_new = np.zeros(Ni)
+        C_new[-1] = dp[-1]
+        for i in range(Ni - 2, -1, -1):
+            C_new[i] = dp[i] - cp[i] * C_new[i + 1]
+
+        C_all[0, n + 1] = bc_left[n + 1]
+        C_all[1:-1, n + 1] = C_new
+        C_all[-1, n + 1] = bc_right[n + 1]
+
+    return C_all
+
+
+def method_pde_kloss(x, data, times, n_bc=10):
+    """Optimise D_eff and k_loss jointly by minimising PDE residual."""
+    bc_l = data[:n_bc, :].mean(axis=0)
+    bc_r = data[-n_bc:, :].mean(axis=0)
+    margin = n_bc + 5
+
+    def objective(params):
+        log_D, log_k = params
+        D = np.exp(log_D)
+        k = np.exp(log_k)
+        C_sim = solve_CN_kloss(data[:, 0], x, times, D, k, bc_l, bc_r)
+        return np.sum((C_sim[margin:-margin, 1:] - data[margin:-margin, 1:]) ** 2)
+
+    result = minimize(objective, [np.log(1e-4), np.log(1e-4)],
+                      method="Nelder-Mead",
+                      options={"maxiter": 5000, "xatol": 1e-10, "fatol": 1e-10})
+
+    D_opt = np.exp(result.x[0])
+    k_opt = np.exp(result.x[1])
+
+    C_sim = solve_CN_kloss(data[:, 0], x, times, D_opt, k_opt, bc_l, bc_r)
+    n_pts = (data.shape[0] - 2 * margin) * (data.shape[1] - 1)
+    rmse = np.sqrt(result.fun / n_pts)
+
+    return {"D_eff": D_opt, "k_loss": k_opt, "RMSE": rmse, "C_sim": C_sim}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DERIVED METRICS
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_flux(x, data, D_eff, n_edge=15):
+    """Compute local oxygen flux J(x,t) = -D_eff * dC/dx using central differences."""
+    bl = 0.5 * (data[:n_edge, 0].mean() + data[-n_edge:, 0].mean())
+    dx = np.median(np.diff(x))
+    dCdx = np.gradient(data - bl, dx, axis=0)
+    flux = -D_eff * dCdx
+    return flux
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # RETENTION METRICS
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -217,18 +402,22 @@ def compute_retention(x, data, times, n_edge=15):
 # PLOTTING
 # ═══════════════════════════════════════════════════════════════════════
 
-def make_plots(x, times, data, mom, pde, ret, t_start_min):
-    """Return a matplotlib Figure with 6 diagnostic subplots."""
+def make_plots(x, times, data, mom, pde, ret, t_start_min, gauss=None, pde_k=None, flux=None):
+    """Return a matplotlib Figure with 9 diagnostic subplots."""
     t_min = times / 60
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
     fig.suptitle(
-        f"Diffusion Analysis  |  D_moment = {mom['D']:.3e} mm\u00b2/s  |  "
-        f"D_pde = {pde['D']:.3e} mm\u00b2/s  |  "
+        f"Diffusion Analysis  |  D_moment = {mom['D']:.3e}  |  "
+        f"D_pde = {pde['D']:.3e}  |  "
+        f"D_eff(Gauss) = {gauss['D_eff']:.3e}  |  "
+        f"k_loss(Gauss) = {gauss['k_loss']:.3e}  |  "
         f"\u03c4_half = {ret['tau_half_peak'] / 60:.1f} min  |  "
-        f"(loading phase removed: first {t_start_min} min)",
-        fontsize=11, fontweight="bold",
+        f"(loading removed: {t_start_min} min)",
+        fontsize=10, fontweight="bold",
     )
+
+    # ── Row 1 ──────────────────────────────────────────────────────────
 
     # 1 - Raw profiles
     ax = axes[0, 0]
@@ -253,7 +442,7 @@ def make_plots(x, times, data, mom, pde, ret, t_start_min):
     ax.set_title(f"Moment Method (R\u00b2 = {mom['R2']:.3f})")
     ax.legend(fontsize=8)
 
-    # 3 - Instantaneous D
+    # 3 - Instantaneous D with all methods
     ax = axes[0, 2]
     mask = np.array(mom["D_inst_v"]) > 0
     if mask.any():
@@ -262,12 +451,19 @@ def make_plots(x, times, data, mom, pde, ret, t_start_min):
                      "o-", ms=4, lw=1, c="teal")
     ax.axhline(mom["D"], color="red", ls="--", lw=1, label=f"D_moment = {mom['D']:.3e}")
     ax.axhline(pde["D"], color="orange", ls="--", lw=1, label=f"D_pde = {pde['D']:.3e}")
+    ax.axhline(gauss["D_eff"], color="purple", ls="--", lw=1,
+               label=f"D_eff(Gauss) = {gauss['D_eff']:.3e}")
+    if pde_k is not None:
+        ax.axhline(pde_k["D_eff"], color="green", ls="--", lw=1,
+                   label=f"D_eff(PDE+k) = {pde_k['D_eff']:.3e}")
     ax.set_xlabel("Time (min)")
     ax.set_ylabel("D_instantaneous (mm\u00b2/s)")
     ax.set_title("Instantaneous D (\u0394\u03c3\u00b2/2\u0394t)")
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=7)
 
-    # 4 - PDE fit: data vs sim
+    # ── Row 2 ──────────────────────────────────────────────────────────
+
+    # 4 - PDE fit: data vs sim (no k_loss)
     ax = axes[1, 0]
     for i in [0, 5, 12, 30, len(times) - 1]:
         if i < len(times):
@@ -278,8 +474,37 @@ def make_plots(x, times, data, mom, pde, ret, t_start_min):
     ax.set_title(f"PDE Fit (D = {pde['D']:.3e}, RMSE = {pde['RMSE']:.1f})")
     ax.legend(fontsize=7, ncol=2)
 
-    # 5 - Peak excess decay
+    # 5 - Gaussian+k_loss fit: data vs model
     ax = axes[1, 1]
+    for i in [0, 5, 12, 30, len(times) - 1]:
+        if i < len(times):
+            ax.plot(x, data[:, i], "-", lw=1.2, alpha=0.8, label=f"data {t_min[i]:.0f}m")
+            ax.plot(x, gauss["C_sim"][:, i], "--", lw=1, alpha=0.6)
+    ax.set_xlabel("Position (mm)")
+    ax.set_ylabel("O\u2082 (% Air Sat.)")
+    ax.set_title(
+        f"Gaussian+k_loss (D_eff={gauss['D_eff']:.2e}, "
+        f"k={gauss['k_loss']:.2e}, RMSE={gauss['RMSE']:.1f})")
+    ax.legend(fontsize=7, ncol=2)
+
+    # 6 - PDE+k_loss fit: data vs sim
+    ax = axes[1, 2]
+    if pde_k is not None:
+        for i in [0, 5, 12, 30, len(times) - 1]:
+            if i < len(times):
+                ax.plot(x, data[:, i], "-", lw=1.2, alpha=0.8, label=f"data {t_min[i]:.0f}m")
+                ax.plot(x, pde_k["C_sim"][:, i], "--", lw=1, alpha=0.6)
+        ax.set_title(
+            f"PDE+k_loss (D_eff={pde_k['D_eff']:.2e}, "
+            f"k={pde_k['k_loss']:.2e}, RMSE={pde_k['RMSE']:.1f})")
+    ax.set_xlabel("Position (mm)")
+    ax.set_ylabel("O\u2082 (% Air Sat.)")
+    ax.legend(fontsize=7, ncol=2)
+
+    # ── Row 3 ──────────────────────────────────────────────────────────
+
+    # 7 - Peak excess decay
+    ax = axes[2, 0]
     ax.plot(t_min, ret["peak_excess"], "o-", ms=2, lw=1, c="crimson")
     if not np.isnan(ret["tau_half_peak"]):
         ax.axvline(ret["tau_half_peak"] / 60, color="gray", ls="--", lw=1,
@@ -290,13 +515,34 @@ def make_plots(x, times, data, mom, pde, ret, t_start_min):
     ax.set_title("Peak Decay \u2192 \u03c4_half_peak")
     ax.legend(fontsize=9)
 
-    # 6 - FWHM
-    ax = axes[1, 2]
+    # 8 - FWHM + Diffusion length
+    ax = axes[2, 1]
     valid_fwhm = ~np.isnan(ret["fwhm"])
-    ax.plot(t_min[valid_fwhm], ret["fwhm"][valid_fwhm], "s-", ms=3, lw=1, c="teal")
+    ax.plot(t_min[valid_fwhm], ret["fwhm"][valid_fwhm], "s-", ms=3, lw=1, c="teal",
+            label="FWHM (data)")
+    ax.plot(t_min, gauss["L_d"], "--", lw=1.5, c="purple",
+            label=f"L_d = \u221a(2D_eff\u00b7t)  (D_eff={gauss['D_eff']:.2e})")
     ax.set_xlabel("Time (min)")
-    ax.set_ylabel("FWHM (mm)")
-    ax.set_title("Profile Width (FWHM of excess)")
+    ax.set_ylabel("Distance (mm)")
+    ax.set_title("Profile Width & Diffusion Length")
+    ax.legend(fontsize=7)
+
+    # 9 - Flux at peak position over time
+    ax = axes[2, 2]
+    if flux is not None:
+        peak_idx = np.argmax(np.abs(flux[:, 0]))
+        mid = data.shape[0] // 2
+        # Show flux at a few positions around the peak
+        offsets = [mid - mid // 3, mid, mid + mid // 3]
+        for pos_idx in offsets:
+            if 0 <= pos_idx < flux.shape[0]:
+                ax.plot(t_min, flux[pos_idx, :], "-", lw=1,
+                        label=f"x = {x[pos_idx]:.1f} mm")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("J (flux, arb. units)")
+    ax.set_title(f"Local O\u2082 Flux  J = -D_eff \u00b7 dC/dx")
+    ax.legend(fontsize=7)
+    ax.axhline(0, color="gray", ls=":", lw=0.5)
 
     plt.tight_layout()
     return fig
@@ -364,6 +610,41 @@ def run_analysis(raw_bytes, filename):
     col1.metric("D_pde", f"{pde['D']:.4e} mm\u00b2/s")
     col2.metric("RMSE", f"{pde['RMSE']:.2f} % Air Sat.")
 
+    # --- Method 3: Gaussian + k_loss ---
+    st.subheader("Method 3: Gaussian + k_loss (D_eff with source depletion)")
+    st.caption(
+        "Model: u(x,t) = A/\u221a(t+t\u2080) \u00b7 exp(-(x-x\u2080)\u00b2 / "
+        "(4\u00b7D_eff\u00b7(t+t\u2080))) \u00b7 exp(-k_loss\u00b7t)"
+    )
+    with st.spinner("Fitting Gaussian+k_loss model..."):
+        gauss = method_gaussian_kloss(x, data, times)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("D_eff (Gaussian)", f"{gauss['D_eff']:.4e} mm\u00b2/s")
+    col2.metric("k_loss", f"{gauss['k_loss']:.4e} s\u207b\u00b9")
+    col3.metric("RMSE", f"{gauss['RMSE']:.2f} % Air Sat.")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("t\u2080 (offset)", f"{gauss['t0']:.1f} s")
+    c2.metric("x\u2080 (center)", f"{gauss['x0']:.2f} mm")
+    c3.metric("L_d (t=end)", f"{gauss['L_d'][-1]:.2f} mm")
+
+    # --- Method 4: PDE + k_loss ---
+    st.subheader("Method 4: PDE + k_loss (Reaction-Diffusion)")
+    st.caption(
+        "Model: \u2202u/\u2202t = D_eff \u00b7 \u2202\u00b2u/\u2202x\u00b2 - k_loss \u00b7 u  "
+        "(Crank-Nicolson with first-order loss term)"
+    )
+    with st.spinner("Optimising D_eff and k_loss jointly..."):
+        pde_k = method_pde_kloss(x, data, times)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("D_eff (PDE+k)", f"{pde_k['D_eff']:.4e} mm\u00b2/s")
+    col2.metric("k_loss (PDE+k)", f"{pde_k['k_loss']:.4e} s\u207b\u00b9")
+    col3.metric("RMSE", f"{pde_k['RMSE']:.2f} % Air Sat.")
+
+    # --- Derived: Flux ---
+    flux = compute_flux(x, data, gauss["D_eff"])
+
     # --- Retention ---
     st.subheader("Retention Metrics")
     ret = compute_retention(x, data, times)
@@ -389,20 +670,24 @@ def run_analysis(raw_bytes, filename):
     # --- Summary ---
     st.subheader("Summary")
     st.markdown(
-        f"| Method | D (mm\u00b2/s) | Quality |\n"
-        f"|--------|--------|---------|\n"
-        f"| Moment (early-time) | `{mom['D']:.4e}` | R\u00b2 = {mom['R2']:.3f} |\n"
-        f"| PDE (full time) | `{pde['D']:.4e}` | RMSE = {pde['RMSE']:.1f} |"
+        f"| Method | D (mm\u00b2/s) | k_loss (s\u207b\u00b9) | Quality |\n"
+        f"|--------|--------|----------|---------|\n"
+        f"| Moment (early-time) | `{mom['D']:.4e}` | \u2014 | R\u00b2 = {mom['R2']:.3f} |\n"
+        f"| PDE (full time) | `{pde['D']:.4e}` | \u2014 | RMSE = {pde['RMSE']:.1f} |\n"
+        f"| Gaussian + k_loss | `{gauss['D_eff']:.4e}` | `{gauss['k_loss']:.4e}` | RMSE = {gauss['RMSE']:.1f} |\n"
+        f"| PDE + k_loss | `{pde_k['D_eff']:.4e}` | `{pde_k['k_loss']:.4e}` | RMSE = {pde_k['RMSE']:.1f} |"
     )
     st.caption(
-        "The two methods may disagree if D is concentration-dependent or if "
-        "there is a source/sink term. The moment method reflects early-time "
-        "behaviour; the PDE method is a global average."
+        "Methods 1\u20132 assume pure diffusion (no loss). Methods 3\u20134 add a first-order "
+        "loss term k_loss that accounts for O\u2082 relaxation back to atmosphere, source "
+        "depletion, and other sink effects. D_eff from methods 3\u20134 is the effective "
+        "diffusion coefficient corrected for these losses."
     )
 
     # --- Plots ---
     st.subheader("Diagnostic Plots")
-    fig = make_plots(x, times, data, mom, pde, ret, t_start_min)
+    fig = make_plots(x, times, data, mom, pde, ret, t_start_min,
+                     gauss=gauss, pde_k=pde_k, flux=flux)
     st.pyplot(fig)
 
     # Download button for the figure
@@ -425,8 +710,14 @@ def run_analysis(raw_bytes, filename):
         "label": label,
         "D_moment": mom["D"],
         "D_pde": pde["D"],
+        "D_eff_gauss": gauss["D_eff"],
+        "k_loss_gauss": gauss["k_loss"],
+        "D_eff_pde_k": pde_k["D_eff"],
+        "k_loss_pde_k": pde_k["k_loss"],
         "R2": mom["R2"],
         "RMSE": pde["RMSE"],
+        "RMSE_gauss": gauss["RMSE"],
+        "RMSE_pde_k": pde_k["RMSE"],
         "tau_half_peak": ret["tau_half_peak"],
         "peak_excess_0": ret["peak_excess"][0],
         "peak_excess_end": ret["peak_excess"][-1],
@@ -436,6 +727,7 @@ def run_analysis(raw_bytes, filename):
         "times": times,
         "peak_excess": ret["peak_excess"],
         "fwhm": ret["fwhm"],
+        "L_d": gauss["L_d"],
     }
 
 
@@ -457,38 +749,58 @@ def make_comparison_section(all_results):
         tau_str = f"{r['tau_half_peak'] / 60:.1f}" if not np.isnan(r["tau_half_peak"]) else "N/A"
         rows.append({
             "Experiment": r["label"],
-            "D_moment (mm\u00b2/s)": f"{r['D_moment']:.4e}",
-            "D_pde (mm\u00b2/s)": f"{r['D_pde']:.4e}",
-            "R\u00b2": f"{r['R2']:.4f}",
-            "RMSE": f"{r['RMSE']:.2f}",
+            "D_moment": f"{r['D_moment']:.4e}",
+            "D_pde": f"{r['D_pde']:.4e}",
+            "D_eff (Gauss)": f"{r['D_eff_gauss']:.4e}",
+            "D_eff (PDE+k)": f"{r['D_eff_pde_k']:.4e}",
+            "k_loss (Gauss)": f"{r['k_loss_gauss']:.4e}",
+            "k_loss (PDE+k)": f"{r['k_loss_pde_k']:.4e}",
             "\u03c4_half (min)": tau_str,
-            "FWHM\u2080 (mm)": f"{r['fwhm_0']:.2f}" if not np.isnan(r["fwhm_0"]) else "N/A",
         })
     st.table(pd.DataFrame(rows))
 
     # --- Bar chart comparison plots ---
     colors = plt.cm.tab10(np.linspace(0, 1, max(n, 10)))[:n]
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle("Experiment Comparison", fontsize=13, fontweight="bold")
 
-    # 1 - D coefficients (grouped bar)
-    ax = axes[0]
     x_pos = np.arange(n)
-    w = 0.35
+
+    # 1 - All D coefficients (grouped bar)
+    ax = axes[0, 0]
+    w = 0.2
     d_mom = [r["D_moment"] for r in all_results]
     d_pde = [r["D_pde"] for r in all_results]
-    bars1 = ax.bar(x_pos - w / 2, d_mom, w, label="D_moment", color="steelblue")
-    bars2 = ax.bar(x_pos + w / 2, d_pde, w, label="D_pde", color="darkorange")
+    d_gauss = [r["D_eff_gauss"] for r in all_results]
+    d_pde_k = [r["D_eff_pde_k"] for r in all_results]
+    ax.bar(x_pos - 1.5 * w, d_mom, w, label="D_moment", color="steelblue")
+    ax.bar(x_pos - 0.5 * w, d_pde, w, label="D_pde", color="darkorange")
+    ax.bar(x_pos + 0.5 * w, d_gauss, w, label="D_eff (Gauss+k)", color="purple")
+    ax.bar(x_pos + 1.5 * w, d_pde_k, w, label="D_eff (PDE+k)", color="green")
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
     ax.set_ylabel("D (mm\u00b2/s)")
-    ax.set_title("Diffusion Coefficients")
+    ax.set_title("Diffusion Coefficients (all methods)")
+    ax.legend(fontsize=7)
+    ax.ticklabel_format(axis="y", style="scientific", scilimits=(-3, -3))
+
+    # 2 - k_loss comparison
+    ax = axes[0, 1]
+    w = 0.35
+    k_gauss = [r["k_loss_gauss"] for r in all_results]
+    k_pde_k = [r["k_loss_pde_k"] for r in all_results]
+    ax.bar(x_pos - w / 2, k_gauss, w, label="k_loss (Gauss)", color="purple")
+    ax.bar(x_pos + w / 2, k_pde_k, w, label="k_loss (PDE+k)", color="green")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("k_loss (s\u207b\u00b9)")
+    ax.set_title("Loss Rate Constant")
     ax.legend(fontsize=8)
     ax.ticklabel_format(axis="y", style="scientific", scilimits=(-3, -3))
 
-    # 2 - Half-life
-    ax = axes[1]
+    # 3 - Half-life
+    ax = axes[0, 2]
     tau_vals = [r["tau_half_peak"] / 60 if not np.isnan(r["tau_half_peak"]) else 0
                 for r in all_results]
     bars = ax.bar(x_pos, tau_vals, color=colors)
@@ -500,24 +812,8 @@ def make_comparison_section(all_results):
         if v > 0:
             ax.text(i, v + 0.3, f"{v:.1f}", ha="center", fontsize=8)
 
-    # 3 - Initial peak excess
-    ax = axes[2]
-    pe_vals = [r["peak_excess_0"] for r in all_results]
-    bars = ax.bar(x_pos, pe_vals, color=colors)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("Peak Excess O\u2082 (% Air Sat.)")
-    ax.set_title("Initial Peak Excess")
-
-    plt.tight_layout()
-    st.pyplot(fig)
-
-    # --- Overlay line plots ---
-    fig2, axes2 = plt.subplots(1, 3, figsize=(16, 5))
-    fig2.suptitle("Time-Series Comparison", fontsize=13, fontweight="bold")
-
-    # 1 - sigma^2 over time
-    ax = axes2[0]
+    # 4 - sigma^2 over time (overlay)
+    ax = axes[1, 0]
     for i, r in enumerate(all_results):
         t_min = r["times"] / 60
         ax.plot(t_min, r["sigma2"], "o-", ms=2, lw=1, color=colors[i], label=r["label"])
@@ -526,8 +822,8 @@ def make_comparison_section(all_results):
     ax.set_title("Variance Growth")
     ax.legend(fontsize=7)
 
-    # 2 - Peak excess decay
-    ax = axes2[1]
+    # 5 - Peak excess decay (overlay)
+    ax = axes[1, 1]
     for i, r in enumerate(all_results):
         t_min = r["times"] / 60
         ax.plot(t_min, r["peak_excess"], "o-", ms=2, lw=1, color=colors[i], label=r["label"])
@@ -536,36 +832,26 @@ def make_comparison_section(all_results):
     ax.set_title("Peak Decay Comparison")
     ax.legend(fontsize=7)
 
-    # 3 - FWHM over time
-    ax = axes2[2]
+    # 6 - Diffusion length over time (overlay)
+    ax = axes[1, 2]
     for i, r in enumerate(all_results):
         t_min = r["times"] / 60
-        valid = ~np.isnan(r["fwhm"])
-        ax.plot(t_min[valid], r["fwhm"][valid], "s-", ms=2, lw=1, color=colors[i],
-                label=r["label"])
+        ax.plot(t_min, r["L_d"], "-", lw=1.5, color=colors[i], label=r["label"])
     ax.set_xlabel("Time (min)")
-    ax.set_ylabel("FWHM (mm)")
-    ax.set_title("Profile Width Comparison")
+    ax.set_ylabel("L_d (mm)")
+    ax.set_title("Diffusion Length \u221a(2D_eff\u00b7t)")
     ax.legend(fontsize=7)
 
     plt.tight_layout()
-    st.pyplot(fig2)
+    st.pyplot(fig)
 
     # Download comparison plots
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
     buf.seek(0)
-    buf2 = io.BytesIO()
-    fig2.savefig(buf2, format="png", dpi=180, bbox_inches="tight")
-    buf2.seek(0)
-
-    col1, col2 = st.columns(2)
-    col1.download_button("Download bar charts (PNG)", buf,
-                         "comparison_bars.png", "image/png")
-    col2.download_button("Download time-series comparison (PNG)", buf2,
-                         "comparison_timeseries.png", "image/png")
+    st.download_button("Download comparison plots (PNG)", buf,
+                       "comparison_plots.png", "image/png")
     plt.close(fig)
-    plt.close(fig2)
 
 
 # ─────────────────────── PAGE CONFIG & MAIN ──────────────────────────
