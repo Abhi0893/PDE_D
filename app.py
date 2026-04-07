@@ -307,7 +307,11 @@ def make_plots(x, times, data, mom, pde, ret, t_start_min):
 # ═══════════════════════════════════════════════════════════════════════
 
 def run_analysis(raw_bytes, filename):
-    """Run full diffusion analysis and display results in Streamlit."""
+    """Run full diffusion analysis and display results in Streamlit.
+
+    Returns a dict with key metrics for cross-experiment comparison,
+    or None if analysis fails.
+    """
     x, times_raw, data_raw = load_data_from_bytes(raw_bytes, filename)
 
     st.subheader("Data Overview")
@@ -413,6 +417,155 @@ def run_analysis(raw_bytes, filename):
     )
     plt.close(fig)
 
+    # Return summary for cross-experiment comparison
+    label = filename.rsplit(".", 1)[0]  # strip extension
+    fwhm_valid = ret["fwhm"][~np.isnan(ret["fwhm"])]
+    return {
+        "label": label,
+        "D_moment": mom["D"],
+        "D_pde": pde["D"],
+        "R2": mom["R2"],
+        "RMSE": pde["RMSE"],
+        "tau_half_peak": ret["tau_half_peak"],
+        "peak_excess_0": ret["peak_excess"][0],
+        "peak_excess_end": ret["peak_excess"][-1],
+        "fwhm_0": ret["fwhm"][0] if len(fwhm_valid) > 0 else np.nan,
+        "fwhm_end": fwhm_valid[-1] if len(fwhm_valid) > 0 else np.nan,
+        "sigma2": mom["sigma2"],
+        "times": times,
+        "peak_excess": ret["peak_excess"],
+        "fwhm": ret["fwhm"],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MULTI-EXPERIMENT COMPARISON
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_comparison_section(all_results):
+    """Display comparison plots and table for multiple experiments."""
+    st.header("Cross-Experiment Comparison")
+
+    labels = [r["label"] for r in all_results]
+    n = len(all_results)
+
+    # --- Summary table ---
+    st.subheader("Comparison Table")
+    rows = []
+    for r in all_results:
+        tau_str = f"{r['tau_half_peak'] / 60:.1f}" if not np.isnan(r["tau_half_peak"]) else "N/A"
+        rows.append({
+            "Experiment": r["label"],
+            "D_moment (mm\u00b2/s)": f"{r['D_moment']:.4e}",
+            "D_pde (mm\u00b2/s)": f"{r['D_pde']:.4e}",
+            "R\u00b2": f"{r['R2']:.4f}",
+            "RMSE": f"{r['RMSE']:.2f}",
+            "\u03c4_half (min)": tau_str,
+            "FWHM\u2080 (mm)": f"{r['fwhm_0']:.2f}" if not np.isnan(r["fwhm_0"]) else "N/A",
+        })
+    st.table(pd.DataFrame(rows))
+
+    # --- Bar chart comparison plots ---
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n, 10)))[:n]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle("Experiment Comparison", fontsize=13, fontweight="bold")
+
+    # 1 - D coefficients (grouped bar)
+    ax = axes[0]
+    x_pos = np.arange(n)
+    w = 0.35
+    d_mom = [r["D_moment"] for r in all_results]
+    d_pde = [r["D_pde"] for r in all_results]
+    bars1 = ax.bar(x_pos - w / 2, d_mom, w, label="D_moment", color="steelblue")
+    bars2 = ax.bar(x_pos + w / 2, d_pde, w, label="D_pde", color="darkorange")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("D (mm\u00b2/s)")
+    ax.set_title("Diffusion Coefficients")
+    ax.legend(fontsize=8)
+    ax.ticklabel_format(axis="y", style="scientific", scilimits=(-3, -3))
+
+    # 2 - Half-life
+    ax = axes[1]
+    tau_vals = [r["tau_half_peak"] / 60 if not np.isnan(r["tau_half_peak"]) else 0
+                for r in all_results]
+    bars = ax.bar(x_pos, tau_vals, color=colors)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("\u03c4_half (min)")
+    ax.set_title("Peak Half-Life")
+    for i, v in enumerate(tau_vals):
+        if v > 0:
+            ax.text(i, v + 0.3, f"{v:.1f}", ha="center", fontsize=8)
+
+    # 3 - Initial peak excess
+    ax = axes[2]
+    pe_vals = [r["peak_excess_0"] for r in all_results]
+    bars = ax.bar(x_pos, pe_vals, color=colors)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Peak Excess O\u2082 (% Air Sat.)")
+    ax.set_title("Initial Peak Excess")
+
+    plt.tight_layout()
+    st.pyplot(fig)
+
+    # --- Overlay line plots ---
+    fig2, axes2 = plt.subplots(1, 3, figsize=(16, 5))
+    fig2.suptitle("Time-Series Comparison", fontsize=13, fontweight="bold")
+
+    # 1 - sigma^2 over time
+    ax = axes2[0]
+    for i, r in enumerate(all_results):
+        t_min = r["times"] / 60
+        ax.plot(t_min, r["sigma2"], "o-", ms=2, lw=1, color=colors[i], label=r["label"])
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("\u03c3\u00b2 (mm\u00b2)")
+    ax.set_title("Variance Growth")
+    ax.legend(fontsize=7)
+
+    # 2 - Peak excess decay
+    ax = axes2[1]
+    for i, r in enumerate(all_results):
+        t_min = r["times"] / 60
+        ax.plot(t_min, r["peak_excess"], "o-", ms=2, lw=1, color=colors[i], label=r["label"])
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Peak Excess O\u2082")
+    ax.set_title("Peak Decay Comparison")
+    ax.legend(fontsize=7)
+
+    # 3 - FWHM over time
+    ax = axes2[2]
+    for i, r in enumerate(all_results):
+        t_min = r["times"] / 60
+        valid = ~np.isnan(r["fwhm"])
+        ax.plot(t_min[valid], r["fwhm"][valid], "s-", ms=2, lw=1, color=colors[i],
+                label=r["label"])
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("FWHM (mm)")
+    ax.set_title("Profile Width Comparison")
+    ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    st.pyplot(fig2)
+
+    # Download comparison plots
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    buf.seek(0)
+    buf2 = io.BytesIO()
+    fig2.savefig(buf2, format="png", dpi=180, bbox_inches="tight")
+    buf2.seek(0)
+
+    col1, col2 = st.columns(2)
+    col1.download_button("Download bar charts (PNG)", buf,
+                         "comparison_bars.png", "image/png")
+    col2.download_button("Download time-series comparison (PNG)", buf2,
+                         "comparison_timeseries.png", "image/png")
+    plt.close(fig)
+    plt.close(fig2)
+
 
 # ─────────────────────── PAGE CONFIG & MAIN ──────────────────────────
 
@@ -424,9 +577,10 @@ st.set_page_config(
 
 st.title("\U0001f9ea Diffusion Coefficient (D) Analyzer")
 st.markdown(
-    "Upload a **CSV** or **Excel** file containing 1D oxygen cross-section "
-    "data to compute the diffusion coefficient using two independent methods "
-    "and view retention metrics."
+    "Upload one or more **CSV** or **Excel** files containing 1D oxygen "
+    "cross-section data. Each file is analysed independently, and when "
+    "multiple files are uploaded, **comparison plots** of D coefficients, "
+    "half-life, and other metrics are generated automatically."
 )
 
 with st.expander("Expected file format"):
@@ -443,18 +597,32 @@ The oxygen profile should peak at the material centre and flatten over time
         """
     )
 
-uploaded = st.file_uploader(
-    "Upload your data file",
+uploaded_files = st.file_uploader(
+    "Upload your data file(s)",
     type=["csv", "xlsx", "xls"],
-    help="CSV or Excel with the format described above.",
+    accept_multiple_files=True,
+    help="CSV or Excel with the format described above. Upload multiple files to compare experiments.",
 )
 
-if uploaded is not None:
-    raw_bytes = uploaded.getvalue()
-    try:
-        run_analysis(raw_bytes, uploaded.name)
-    except Exception as e:
-        st.error(f"Analysis failed: {e}")
-        st.exception(e)
+if uploaded_files:
+    # Collect results from each experiment for comparison
+    all_results = []
+
+    for uploaded in uploaded_files:
+        raw_bytes = uploaded.getvalue()
+        st.markdown("---")
+        st.header(f"Experiment: {uploaded.name}")
+        try:
+            result = run_analysis(raw_bytes, uploaded.name)
+            if result is not None:
+                all_results.append(result)
+        except Exception as e:
+            st.error(f"Analysis failed for {uploaded.name}: {e}")
+            st.exception(e)
+
+    # --- Multi-experiment comparison ---
+    if len(all_results) >= 2:
+        st.markdown("---")
+        make_comparison_section(all_results)
 else:
-    st.info("Upload a file to get started.")
+    st.info("Upload one or more files to get started.")
