@@ -14,11 +14,15 @@ import io
 import csv
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize_scalar, curve_fit
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
+
+
+# np.trapz was removed in NumPy 2.0 in favor of np.trapezoid.
+_trapz = getattr(np, "trapezoid", None) or np.trapz  # type: ignore[attr-defined]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -214,6 +218,235 @@ def compute_retention(x, data, times, n_edge=15):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# RELEASE KINETICS METRICS
+#   (AUC above therapeutic threshold, penetration depth L_p(t),
+#    source depletion M_source(t), release rate -dM/dt)
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_kinetics_metrics(
+    x, data, times,
+    n_edge=15,
+    c_threshold_excess=50.0,
+    pen_threshold_frac=0.10,
+    pen_threshold_abs=5.0,
+):
+    """Compute oxygen release kinetics metrics from C(x,t).
+
+    Parameters
+    ----------
+    c_threshold_excess : float
+        Therapeutic threshold, expressed as excess (% Air Sat.) ABOVE
+        the GelMA baseline. AUC is integrated over any signal exceeding
+        this level.
+    pen_threshold_frac : float
+        Penetration is measured where excess > frac * initial_peak_excess.
+    pen_threshold_abs : float
+        Absolute floor (% Air Sat.) for the penetration threshold, to
+        avoid being fooled by late-time noise.
+
+    Returns
+    -------
+    dict with:
+        auc_xt        : scalar, (% Air Sat.)*mm*s   -- Metric 3
+        auc_spatial_t : array[T], (% Air Sat.)*mm   -- spatial integral at each t
+        L_p           : array[T], mm                 -- Metric 4 (width above thr)
+        M_source      : array[T], (% Air Sat.)*mm   -- source region mass
+        release_rate  : array[T], (% Air Sat.)*mm/s -- -dM/dt (Metric 5)
+        src_lo, src_hi: ints, source region bounds (pixel indices)
+        pen_threshold : float, actual absolute threshold used for L_p
+        c_threshold_excess : float, AUC threshold echoed back
+        baseline      : float, baseline C used
+    """
+    bl = 0.5 * (data[:n_edge, 0].mean() + data[-n_edge:, 0].mean())
+    excess = data - bl
+    dx = np.median(np.diff(x))
+    N, T = data.shape
+
+    # --- Metric 3: AUC above therapeutic threshold ---
+    # Threshold is interpreted as "excess above baseline" so it is
+    # independent of the absolute baseline value (which depends on the
+    # sensor calibration).
+    above_th = np.maximum(excess - c_threshold_excess, 0.0)
+    auc_spatial_t = np.sum(above_th, axis=0) * dx     # (% Air Sat)*mm
+    if len(times) > 1:
+        auc_xt = float(_trapz(auc_spatial_t, times))  # *s
+    else:
+        auc_xt = 0.0
+
+    # --- Metric 4: Penetration depth L_p(t) ---
+    peak0 = float(excess[:, 0].max())
+    pen_th = max(pen_threshold_frac * peak0, pen_threshold_abs)
+    L_p = np.zeros(T)
+    for t in range(T):
+        above = np.where(excess[:, t] > pen_th)[0]
+        if len(above) >= 2:
+            L_p[t] = x[above[-1]] - x[above[0]]
+
+    # --- Metric 5: Source mass & release rate ---
+    # Define the "source region" as the FWHM of the initial profile.
+    prof0 = excess[:, 0]
+    hm0 = prof0.max() / 2.0
+    above0 = np.where(prof0 > hm0)[0]
+    if len(above0) >= 2:
+        src_lo, src_hi = int(above0[0]), int(above0[-1])
+    else:
+        peak_idx = int(np.argmax(prof0))
+        half_w = max(1, N // 20)
+        src_lo = max(0, peak_idx - half_w)
+        src_hi = min(N - 1, peak_idx + half_w)
+
+    M_source = np.sum(np.maximum(excess[src_lo:src_hi + 1, :], 0.0), axis=0) * dx
+
+    # Release rate = -dM/dt (central diff on interior, forward/backward on ends)
+    release_rate = np.zeros(T)
+    if T >= 2:
+        for t in range(T):
+            if t == 0:
+                dt_ = times[1] - times[0]
+                if dt_ > 0:
+                    release_rate[t] = -(M_source[1] - M_source[0]) / dt_
+            elif t == T - 1:
+                dt_ = times[-1] - times[-2]
+                if dt_ > 0:
+                    release_rate[t] = -(M_source[-1] - M_source[-2]) / dt_
+            else:
+                dt_ = times[t + 1] - times[t - 1]
+                if dt_ > 0:
+                    release_rate[t] = -(M_source[t + 1] - M_source[t - 1]) / dt_
+
+    return {
+        "auc_xt": auc_xt,
+        "auc_spatial_t": auc_spatial_t,
+        "L_p": L_p,
+        "M_source": M_source,
+        "release_rate": release_rate,
+        "src_lo": src_lo,
+        "src_hi": src_hi,
+        "pen_threshold": pen_th,
+        "c_threshold_excess": c_threshold_excess,
+        "baseline": bl,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RELEASE KINETICS MODEL FITS
+#   (First-order, Korsmeyer-Peppas, Higuchi)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _safe_r2(y, y_pred):
+    y = np.asarray(y, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    ss_res = float(np.sum((y - y_pred) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+
+def fit_release_models(times, peak_excess):
+    """Fit first-order, Korsmeyer-Peppas, and Higuchi release models to
+    the peak-excess decay curve.
+
+    peak_excess is used as a proxy for remaining "undelivered" oxygen in
+    the source. Fractional release is M(t)/M_inf = 1 - C_ex(t)/C_ex(0).
+
+    Returns dict with fitted parameters and R^2 for each model. Any model
+    that fails to fit is reported with NaNs.
+    """
+    t = np.asarray(times, dtype=float)
+    pe = np.asarray(peak_excess, dtype=float)
+
+    nan_fo = {"C0": np.nan, "k": np.nan, "R2": np.nan, "tau_half": np.nan}
+    nan_kp = {"k": np.nan, "n": np.nan, "R2": np.nan, "n_points": 0}
+    nan_hi = {"k_H": np.nan, "R2": np.nan}
+
+    if len(t) < 3 or pe[0] <= 0:
+        return {"first_order": nan_fo, "korsmeyer_peppas": nan_kp, "higuchi": nan_hi}
+
+    results = {}
+
+    # ---- First-order: C_ex(t) = C0 * exp(-k * t) ----
+    try:
+        popt, _ = curve_fit(
+            lambda tt, C0, k: C0 * np.exp(-k * tt),
+            t, pe,
+            p0=[pe[0], 1e-3],
+            bounds=([0, 0], [10 * pe[0] + 1, 1.0]),
+            maxfev=5000,
+        )
+        C0_fo, k_fo = float(popt[0]), float(popt[1])
+        pred = C0_fo * np.exp(-k_fo * t)
+        R2_fo = _safe_r2(pe, pred)
+        tau_fo = float(np.log(2) / k_fo) if k_fo > 0 else np.nan
+        results["first_order"] = {
+            "C0": C0_fo, "k": k_fo, "R2": R2_fo, "tau_half": tau_fo,
+        }
+    except Exception:
+        results["first_order"] = dict(nan_fo)
+
+    # ---- Fractional release ----
+    frac_rel = 1.0 - pe / pe[0]
+    frac_rel = np.clip(frac_rel, 0.0, 1.0)
+
+    # ---- Korsmeyer-Peppas: M/M_inf = k * t^n, valid for M/M_inf < 0.6 ----
+    mask_kp = (t > 0) & (frac_rel > 1e-4) & (frac_rel < 0.6)
+    if mask_kp.sum() >= 3:
+        try:
+            popt, _ = curve_fit(
+                lambda tt, k, n: k * np.power(tt, n),
+                t[mask_kp], frac_rel[mask_kp],
+                p0=[1e-3, 0.5],
+                bounds=([0.0, 0.05], [10.0, 2.0]),
+                maxfev=5000,
+            )
+            k_kp, n_kp = float(popt[0]), float(popt[1])
+            pred = k_kp * np.power(t[mask_kp], n_kp)
+            R2_kp = _safe_r2(frac_rel[mask_kp], pred)
+            results["korsmeyer_peppas"] = {
+                "k": k_kp, "n": n_kp, "R2": R2_kp, "n_points": int(mask_kp.sum()),
+            }
+        except Exception:
+            results["korsmeyer_peppas"] = dict(nan_kp)
+    else:
+        results["korsmeyer_peppas"] = dict(nan_kp)
+
+    # ---- Higuchi: M/M_inf = k_H * sqrt(t) ----
+    mask_h = t > 0
+    if mask_h.sum() >= 3:
+        try:
+            popt, _ = curve_fit(
+                lambda tt, k_H: k_H * np.sqrt(tt),
+                t[mask_h], frac_rel[mask_h],
+                p0=[1e-3],
+                bounds=([0.0], [10.0]),
+                maxfev=5000,
+            )
+            k_H = float(popt[0])
+            pred = k_H * np.sqrt(t[mask_h])
+            R2_h = _safe_r2(frac_rel[mask_h], pred)
+            results["higuchi"] = {"k_H": k_H, "R2": R2_h}
+        except Exception:
+            results["higuchi"] = dict(nan_hi)
+    else:
+        results["higuchi"] = dict(nan_hi)
+
+    return results
+
+
+def classify_kp_mechanism(n):
+    """Return a short mechanistic label for the Korsmeyer-Peppas exponent."""
+    if n is None or np.isnan(n):
+        return "N/A"
+    if n < 0.45:
+        return "Sub-Fickian (n<0.45)"
+    if n < 0.55:
+        return "Fickian diffusion (n\u22480.5)"
+    if n < 0.95:
+        return "Anomalous transport (0.5<n<1)"
+    if n < 1.05:
+        return "Zero-order / Case II (n\u22481)"
+    return "Super Case II (n>1)"
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # PLOTTING
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -297,6 +530,126 @@ def make_plots(x, times, data, mom, pde, ret, t_start_min):
     ax.set_xlabel("Time (min)")
     ax.set_ylabel("FWHM (mm)")
     ax.set_title("Profile Width (FWHM of excess)")
+
+    plt.tight_layout()
+    return fig
+
+
+def make_kinetics_plots(x, times, data, ret, kin, fits):
+    """Figure with release kinetics diagnostics:
+      1 - Peak excess decay with model fits
+      2 - Fractional release + Korsmeyer-Peppas fit (log-log)
+      3 - Source mass M_source(t) and release rate
+      4 - Penetration depth L_p(t)
+      5 - AUC spatial integral vs time (therapeutic coverage)
+      6 - Source region overlay on initial profile
+    """
+    t_min = times / 60.0
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    kp_n = fits["korsmeyer_peppas"]["n"]
+    kp_label = classify_kp_mechanism(kp_n)
+    fig.suptitle(
+        f"Release Kinetics  |  AUC = {kin['auc_xt']:.1f} %\u00b7mm\u00b7s  |  "
+        f"first-order \u03c4\u00bd = "
+        f"{(fits['first_order']['tau_half'] / 60 if not np.isnan(fits['first_order']['tau_half']) else float('nan')):.1f} min  |  "
+        f"K-P n = {kp_n:.3f} ({kp_label})",
+        fontsize=11, fontweight="bold",
+    )
+
+    pe = ret["peak_excess"]
+
+    # 1 - Peak excess decay with first-order fit
+    ax = axes[0, 0]
+    ax.plot(t_min, pe, "o", ms=3, c="crimson", label="data")
+    fo = fits["first_order"]
+    if not np.isnan(fo["k"]):
+        t_dense = np.linspace(times[0], times[-1], 200)
+        ax.plot(t_dense / 60, fo["C0"] * np.exp(-fo["k"] * t_dense),
+                "-", c="navy", lw=1.5,
+                label=f"first-order (R\u00b2={fo['R2']:.3f})")
+    if not np.isnan(ret["tau_half_peak"]):
+        ax.axvline(ret["tau_half_peak"] / 60, color="gray", ls="--", lw=1,
+                   label=f"\u03c4\u00bd (empirical) = {ret['tau_half_peak']/60:.1f} min")
+        ax.axhline(pe[0] / 2, color="gray", ls=":", lw=0.8)
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Peak Excess O\u2082 (% Air Sat.)")
+    ax.set_title("Metric 1/2: C_peak(t) & \u03c4\u00bd")
+    ax.legend(fontsize=8)
+
+    # 2 - Fractional release + Korsmeyer-Peppas + Higuchi (log-log)
+    ax = axes[0, 1]
+    frac_rel = np.clip(1.0 - pe / pe[0], 0.0, 1.0)
+    mask = times > 0
+    ax.loglog(times[mask], np.clip(frac_rel[mask], 1e-4, None),
+              "o", ms=3, c="crimson", label="data")
+    kp = fits["korsmeyer_peppas"]
+    if not np.isnan(kp["k"]):
+        t_dense = np.linspace(times[1] if len(times) > 1 else 1, times[-1], 200)
+        ax.loglog(t_dense, kp["k"] * np.power(t_dense, kp["n"]),
+                  "-", c="navy", lw=1.5,
+                  label=f"K-P n={kp['n']:.3f} R\u00b2={kp['R2']:.3f}")
+    hi = fits["higuchi"]
+    if not np.isnan(hi["k_H"]):
+        t_dense = np.linspace(times[1] if len(times) > 1 else 1, times[-1], 200)
+        ax.loglog(t_dense, hi["k_H"] * np.sqrt(t_dense),
+                  "--", c="darkgreen", lw=1.2,
+                  label=f"Higuchi R\u00b2={hi['R2']:.3f}")
+    ax.set_xlabel("Time (s, log)")
+    ax.set_ylabel("M(t)/M\u221e (log)")
+    ax.set_title("Fractional Release (K-P / Higuchi)")
+    ax.legend(fontsize=8)
+    ax.grid(True, which="both", alpha=0.3)
+
+    # 3 - Source mass M_source(t) and release rate
+    ax = axes[0, 2]
+    ax.plot(t_min, kin["M_source"], "o-", ms=3, lw=1, c="darkorange",
+            label="M_source(t)")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("M_source (% Air Sat. \u00b7 mm)", color="darkorange")
+    ax.tick_params(axis="y", labelcolor="darkorange")
+    ax.set_title("Metric 5: Source depletion & release rate")
+    ax2 = ax.twinx()
+    ax2.plot(t_min, kin["release_rate"], "s-", ms=2, lw=1, c="teal", alpha=0.7,
+             label="-dM/dt")
+    ax2.set_ylabel("-dM/dt (% Air Sat. \u00b7 mm / s)", color="teal")
+    ax2.tick_params(axis="y", labelcolor="teal")
+    ax2.axhline(0, color="gray", ls=":", lw=0.5)
+
+    # 4 - Penetration depth L_p(t)
+    ax = axes[1, 0]
+    ax.plot(t_min, kin["L_p"], "o-", ms=3, lw=1, c="purple")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Penetration depth L_p (mm)")
+    ax.set_title(
+        f"Metric 4: L_p(t)  (thr = {kin['pen_threshold']:.1f} % Air Sat.)"
+    )
+
+    # 5 - AUC spatial integral vs time
+    ax = axes[1, 1]
+    ax.plot(t_min, kin["auc_spatial_t"], "o-", ms=3, lw=1, c="darkgreen")
+    ax.fill_between(t_min, 0, kin["auc_spatial_t"], alpha=0.2, color="darkgreen")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("\u222b (C-C_th)\u207a dx  (% Air Sat. \u00b7 mm)")
+    ax.set_title(
+        f"Metric 3: Therapeutic coverage (thr = +{kin['c_threshold_excess']:.0f} above baseline)\n"
+        f"AUC_xt = {kin['auc_xt']:.1f}"
+    )
+
+    # 6 - Source region overlay on initial profile
+    ax = axes[1, 2]
+    excess0 = data[:, 0] - kin["baseline"]
+    ax.plot(x, excess0, "-", c="steelblue", lw=1.5, label="C_excess(x, t=0)")
+    ax.axvspan(x[kin["src_lo"]], x[kin["src_hi"]], color="orange", alpha=0.25,
+               label="source region (FWHM)")
+    ax.axhline(kin["pen_threshold"], color="purple", ls="--", lw=1,
+               label=f"L_p threshold")
+    ax.axhline(kin["c_threshold_excess"], color="darkgreen", ls=":", lw=1,
+               label="AUC threshold")
+    ax.set_xlabel("Position (mm)")
+    ax.set_ylabel("Excess O\u2082 (% Air Sat.)")
+    ax.set_title("Source region & thresholds (t=0)")
+    ax.legend(fontsize=7)
 
     plt.tight_layout()
     return fig
@@ -386,6 +739,116 @@ def run_analysis(raw_bytes, filename):
             "higher means the material stays oxygenated longer."
         )
 
+    # --- Release Kinetics (5 metrics + 3 model fits) ---
+    st.subheader("Release Kinetics Metrics")
+
+    # User-tunable thresholds
+    cfg1, cfg2 = st.columns(2)
+    c_th_excess = cfg1.number_input(
+        "AUC threshold (% Air Sat. above baseline)",
+        min_value=0.0, max_value=500.0, value=50.0, step=10.0,
+        key=f"auc_th_{filename}",
+        help="Therapeutic threshold expressed as excess above the GelMA baseline.",
+    )
+    pen_frac = cfg2.number_input(
+        "Penetration depth threshold (fraction of initial peak excess)",
+        min_value=0.01, max_value=0.99, value=0.10, step=0.05,
+        key=f"pen_frac_{filename}",
+        help="L_p is the width over which excess > frac \u00d7 initial peak excess.",
+    )
+
+    kin = compute_kinetics_metrics(
+        x, data, times,
+        c_threshold_excess=float(c_th_excess),
+        pen_threshold_frac=float(pen_frac),
+    )
+    fits = fit_release_models(times, ret["peak_excess"])
+
+    # Headline numbers
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        "AUC (% Air Sat \u00b7 mm \u00b7 s)",
+        f"{kin['auc_xt']:.1f}",
+        help="Metric 3: total therapeutic dose above threshold, integrated over space and time.",
+    )
+    k2.metric(
+        "L_p (t=0)",
+        f"{kin['L_p'][0]:.2f} mm",
+        help="Metric 4: penetration depth at t=0.",
+    )
+    k3.metric(
+        "L_p (t=end)",
+        f"{kin['L_p'][-1]:.2f} mm",
+        help="Metric 4: penetration depth at the final timestep.",
+    )
+    rr0 = kin["release_rate"][0]
+    k4.metric(
+        "Initial release rate",
+        f"{rr0:.3f} %\u00b7mm/s",
+        help="Metric 5: -dM_source/dt at t=0.",
+    )
+
+    # Model fits
+    st.markdown("**Release-kinetics model fits** (fit on peak excess decay)")
+    fo = fits["first_order"]
+    kp = fits["korsmeyer_peppas"]
+    hi = fits["higuchi"]
+
+    fit_rows = [
+        {
+            "Model": "First-order  C\u2080 e^(-kt)",
+            "Param 1": f"k = {fo['k']:.4e} s\u207b\u00b9" if not np.isnan(fo["k"]) else "N/A",
+            "Param 2": f"\u03c4\u00bd = {fo['tau_half']/60:.1f} min" if not np.isnan(fo["tau_half"]) else "N/A",
+            "R\u00b2": f"{fo['R2']:.3f}" if not np.isnan(fo["R2"]) else "N/A",
+        },
+        {
+            "Model": "Korsmeyer-Peppas  k t\u207f",
+            "Param 1": f"k = {kp['k']:.4e}" if not np.isnan(kp["k"]) else "N/A",
+            "Param 2": f"n = {kp['n']:.3f} ({classify_kp_mechanism(kp['n'])})" if not np.isnan(kp["n"]) else "N/A",
+            "R\u00b2": f"{kp['R2']:.3f}" if not np.isnan(kp["R2"]) else "N/A",
+        },
+        {
+            "Model": "Higuchi  k_H \u221at",
+            "Param 1": f"k_H = {hi['k_H']:.4e} s^-\u00bd" if not np.isnan(hi["k_H"]) else "N/A",
+            "Param 2": "\u2014",
+            "R\u00b2": f"{hi['R2']:.3f}" if not np.isnan(hi["R2"]) else "N/A",
+        },
+    ]
+    st.table(pd.DataFrame(fit_rows))
+
+    if not np.isnan(kp["n"]):
+        if kp["n"] > 0.85:
+            st.success(
+                f"K-P exponent n = {kp['n']:.2f} \u2192 release is approaching "
+                "barrier-controlled (Case II) kinetics. Strong evidence the matrix "
+                "is converting diffusion-limited release into sustained release."
+            )
+        elif kp["n"] > 0.55:
+            st.info(
+                f"K-P exponent n = {kp['n']:.2f} \u2192 anomalous transport "
+                "(mixed Fickian + barrier control)."
+            )
+        else:
+            st.warning(
+                f"K-P exponent n = {kp['n']:.2f} \u2192 Fickian (diffusion-limited) "
+                "release. The matrix is not (yet) creating a meaningful barrier."
+            )
+
+    # Kinetics plots
+    fig_kin = make_kinetics_plots(x, times, data, ret, kin, fits)
+    st.pyplot(fig_kin)
+    buf_kin = io.BytesIO()
+    fig_kin.savefig(buf_kin, format="png", dpi=180, bbox_inches="tight")
+    buf_kin.seek(0)
+    st.download_button(
+        label="Download kinetics plot as PNG",
+        data=buf_kin,
+        file_name=f"kinetics_{filename}.png",
+        mime="image/png",
+        key=f"download_kin_{filename}",
+    )
+    plt.close(fig_kin)
+
     # --- Summary ---
     st.subheader("Summary")
     st.markdown(
@@ -436,6 +899,24 @@ def run_analysis(raw_bytes, filename):
         "times": times,
         "peak_excess": ret["peak_excess"],
         "fwhm": ret["fwhm"],
+        # Release kinetics
+        "auc_xt": kin["auc_xt"],
+        "auc_spatial_t": kin["auc_spatial_t"],
+        "L_p": kin["L_p"],
+        "M_source": kin["M_source"],
+        "release_rate": kin["release_rate"],
+        "L_p_0": kin["L_p"][0],
+        "L_p_end": kin["L_p"][-1],
+        "release_rate_0": kin["release_rate"][0],
+        "c_threshold_excess": kin["c_threshold_excess"],
+        "fo_k": fits["first_order"]["k"],
+        "fo_tau_half": fits["first_order"]["tau_half"],
+        "fo_R2": fits["first_order"]["R2"],
+        "kp_k": fits["korsmeyer_peppas"]["k"],
+        "kp_n": fits["korsmeyer_peppas"]["n"],
+        "kp_R2": fits["korsmeyer_peppas"]["R2"],
+        "hi_k": fits["higuchi"]["k_H"],
+        "hi_R2": fits["higuchi"]["R2"],
     }
 
 
@@ -465,6 +946,25 @@ def make_comparison_section(all_results):
             "FWHM\u2080 (mm)": f"{r['fwhm_0']:.2f}" if not np.isnan(r["fwhm_0"]) else "N/A",
         })
     st.table(pd.DataFrame(rows))
+
+    # --- Release kinetics comparison table ---
+    st.subheader("Release Kinetics Comparison Table")
+    kin_rows = []
+    for r in all_results:
+        kin_rows.append({
+            "Experiment": r["label"],
+            "AUC (%\u00b7mm\u00b7s)": f"{r['auc_xt']:.1f}",
+            "L_p\u2080 (mm)": f"{r['L_p_0']:.2f}",
+            "L_p_end (mm)": f"{r['L_p_end']:.2f}",
+            "Init. release (%\u00b7mm/s)": f"{r['release_rate_0']:.3f}",
+            "1st-order \u03c4\u00bd (min)": (
+                f"{r['fo_tau_half']/60:.1f}" if not np.isnan(r["fo_tau_half"]) else "N/A"
+            ),
+            "K-P n": f"{r['kp_n']:.3f}" if not np.isnan(r["kp_n"]) else "N/A",
+            "K-P R\u00b2": f"{r['kp_R2']:.3f}" if not np.isnan(r["kp_R2"]) else "N/A",
+            "Mechanism": classify_kp_mechanism(r["kp_n"]),
+        })
+    st.table(pd.DataFrame(kin_rows))
 
     # --- Bar chart comparison plots ---
     colors = plt.cm.tab10(np.linspace(0, 1, max(n, 10)))[:n]
@@ -551,6 +1051,94 @@ def make_comparison_section(all_results):
     plt.tight_layout()
     st.pyplot(fig2)
 
+    # --- Release kinetics bar charts (AUC, K-P n, 1st-order tau) ---
+    fig3, axes3 = plt.subplots(1, 3, figsize=(16, 5))
+    fig3.suptitle("Release Kinetics Comparison", fontsize=13, fontweight="bold")
+
+    # 1 - AUC above therapeutic threshold
+    ax = axes3[0]
+    auc_vals = [r["auc_xt"] for r in all_results]
+    ax.bar(x_pos, auc_vals, color=colors)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("AUC (% Air Sat. \u00b7 mm \u00b7 s)")
+    ax.set_title("Therapeutic AUC (Metric 3)")
+    for i, v in enumerate(auc_vals):
+        ax.text(i, v, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
+
+    # 2 - First-order half-life from fit
+    ax = axes3[1]
+    tau_fo = [
+        (r["fo_tau_half"] / 60) if not np.isnan(r["fo_tau_half"]) else 0
+        for r in all_results
+    ]
+    ax.bar(x_pos, tau_fo, color=colors)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("\u03c4\u00bd (min)")
+    ax.set_title("First-order \u03c4\u00bd (Metric 2)")
+    for i, v in enumerate(tau_fo):
+        if v > 0:
+            ax.text(i, v, f"{v:.1f}", ha="center", va="bottom", fontsize=8)
+
+    # 3 - Korsmeyer-Peppas n
+    ax = axes3[2]
+    n_vals = [r["kp_n"] if not np.isnan(r["kp_n"]) else 0 for r in all_results]
+    ax.bar(x_pos, n_vals, color=colors)
+    ax.axhline(0.5, color="gray", ls="--", lw=1, label="Fickian (n=0.5)")
+    ax.axhline(1.0, color="red", ls="--", lw=1, label="Zero-order (n=1)")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Korsmeyer-Peppas n")
+    ax.set_title("K-P transport exponent")
+    ax.set_ylim(0, max(1.2, max(n_vals + [0]) * 1.1))
+    ax.legend(fontsize=8)
+    for i, v in enumerate(n_vals):
+        if v > 0:
+            ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+
+    plt.tight_layout()
+    st.pyplot(fig3)
+
+    # --- Release kinetics overlay plots (L_p(t), M_source(t), spatial AUC(t)) ---
+    fig4, axes4 = plt.subplots(1, 3, figsize=(16, 5))
+    fig4.suptitle("Release Kinetics Time Series", fontsize=13, fontweight="bold")
+
+    # 1 - Penetration depth L_p(t)
+    ax = axes4[0]
+    for i, r in enumerate(all_results):
+        t_min = r["times"] / 60
+        ax.plot(t_min, r["L_p"], "o-", ms=2, lw=1, color=colors[i], label=r["label"])
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("L_p (mm)")
+    ax.set_title("Penetration Depth (Metric 4)")
+    ax.legend(fontsize=7)
+
+    # 2 - Source mass M_source(t)
+    ax = axes4[1]
+    for i, r in enumerate(all_results):
+        t_min = r["times"] / 60
+        ax.plot(t_min, r["M_source"], "o-", ms=2, lw=1, color=colors[i],
+                label=r["label"])
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("M_source (% Air Sat. \u00b7 mm)")
+    ax.set_title("Source Depletion (Metric 5)")
+    ax.legend(fontsize=7)
+
+    # 3 - Spatial AUC at each time
+    ax = axes4[2]
+    for i, r in enumerate(all_results):
+        t_min = r["times"] / 60
+        ax.plot(t_min, r["auc_spatial_t"], "o-", ms=2, lw=1, color=colors[i],
+                label=r["label"])
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("\u222b (C-C_th)\u207a dx (% Air Sat. \u00b7 mm)")
+    ax.set_title("Therapeutic Coverage vs Time")
+    ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    st.pyplot(fig4)
+
     # Download comparison plots
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
@@ -558,14 +1146,26 @@ def make_comparison_section(all_results):
     buf2 = io.BytesIO()
     fig2.savefig(buf2, format="png", dpi=180, bbox_inches="tight")
     buf2.seek(0)
+    buf3 = io.BytesIO()
+    fig3.savefig(buf3, format="png", dpi=180, bbox_inches="tight")
+    buf3.seek(0)
+    buf4 = io.BytesIO()
+    fig4.savefig(buf4, format="png", dpi=180, bbox_inches="tight")
+    buf4.seek(0)
 
-    col1, col2 = st.columns(2)
-    col1.download_button("Download bar charts (PNG)", buf,
+    col1, col2, col3, col4 = st.columns(4)
+    col1.download_button("Download D / \u03c4\u00bd bars (PNG)", buf,
                          "comparison_bars.png", "image/png")
-    col2.download_button("Download time-series comparison (PNG)", buf2,
+    col2.download_button("Download time-series (PNG)", buf2,
                          "comparison_timeseries.png", "image/png")
+    col3.download_button("Download kinetics bars (PNG)", buf3,
+                         "kinetics_bars.png", "image/png")
+    col4.download_button("Download kinetics time-series (PNG)", buf4,
+                         "kinetics_timeseries.png", "image/png")
     plt.close(fig)
     plt.close(fig2)
+    plt.close(fig3)
+    plt.close(fig4)
 
 
 # ─────────────────────── PAGE CONFIG & MAIN ──────────────────────────
