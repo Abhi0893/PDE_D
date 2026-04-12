@@ -742,6 +742,148 @@ def run_analysis(raw_bytes, filename):
     # --- Release Kinetics (5 metrics + 3 model fits) ---
     st.subheader("Release Kinetics Metrics")
 
+    with st.expander("Metric definitions & formulas", expanded=False):
+        # --- Metric 1 ---
+        st.markdown("#### :blue[Metric 1 \u2014 primary outcome]")
+        st.markdown(
+            "**Peak oxygen decay**\n\n"
+            "Track the maximum O\u2082 concentration across the cross-section at each timestep. "
+            "This is the oxygen level at the source centre."
+        )
+        st.latex(r"C_{\text{peak}}(t) = \max_{x}\,[\,C(x,\,t)\,]")
+        st.latex(r"C_{\text{excess}}(t) = C_{\text{peak}}(t) - C_\infty")
+        st.markdown(
+            "$C(x, t)$ = measured O\u2082 concentration (% Air Saturation) at position $x$, time $t$\n\n"
+            "$C_\\infty$ = atmospheric baseline (~100% Air Sat, from edge pixels at $t = 0$)"
+        )
+        st.info(
+            '**In your meeting:** "We track how the peak oxygen at the PFC source decays over time. '
+            "Higher methylcellulose concentrations should show a slower, flatter decay \u2014 "
+            'sustained delivery rather than a burst."'
+        )
+        st.markdown("---")
+
+        # --- Metric 2 ---
+        st.markdown("#### :blue[Metric 2 \u2014 headline number]")
+        st.markdown(
+            "**Half-life of peak excess oxygen \u2014 \u03c4\u00bd**\n\n"
+            "The time at which the peak excess drops to 50% of its initial value. "
+            "This is the single most important number for comparing materials."
+        )
+        st.latex(
+            r"C_{\text{excess}}(\tau_{1/2}) = \frac{1}{2} \cdot C_{\text{excess}}(0)"
+        )
+        st.markdown(
+            "Computed by linear interpolation between consecutive timesteps where "
+            "$C_{\\text{excess}}$ crosses the 50% threshold.\n\n"
+            "Units: minutes (or seconds)"
+        )
+        st.info(
+            '**In your meeting:** "\u03c4\u00bd directly answers: how long does the material stay oxygenated? '
+            "If \u03c4\u00bd increases from 20 min (no MC) to 80 min (high MC), that's a 4\u00d7 improvement "
+            'in delivery duration. This is our bar chart \u2014 the centrepiece result."'
+        )
+        st.markdown("---")
+
+        # --- Metric 3 ---
+        st.markdown("#### :blue[Metric 3 \u2014 therapeutic dose]")
+        st.markdown(
+            "**Area under the curve \u2014 therapeutic oxygen dose**\n\n"
+            "Total oxygen delivered above a clinically meaningful threshold, integrated over "
+            "both space and time. Ensures sustained release doesn\u2019t sacrifice total dose."
+        )
+        st.latex(
+            r"\text{AUC} = \int_0^T \int_0^L \max\,[\,C(x,t) - C_{\text{th}},\; 0\,]\; dx\; dt"
+        )
+        st.latex(
+            r"\text{AUC}_{\text{discrete}} = \sum_n \sum_i \max\,[\,C(x_i,\,t_n) - C_{\text{th}},\; 0\,]"
+            r"\cdot \Delta x \cdot \Delta t"
+        )
+        st.markdown(
+            "$C_{\\text{th}}$ = therapeutic threshold (e.g. 50% Air Sat \u2014 the level needed to overcome tumour hypoxia)\n\n"
+            "$L$ = total cross-section length, $T$ = experiment duration\n\n"
+            "Units: (% Air Sat) \u00b7 mm \u00b7 s"
+        )
+        st.info(
+            '**In your meeting:** "AUC is the total oxygen dose that exceeds the therapeutic threshold. '
+            "If MC increases \u03c4\u00bd but AUC drops, we\u2019re trapping oxygen \u2014 bad. "
+            "If AUC is maintained or increases, we\u2019re delivering the same total dose over a "
+            'longer period \u2014 exactly what we want."'
+        )
+        st.markdown("---")
+
+        # --- Metric 4 ---
+        st.markdown("#### :green[Metric 4 \u2014 source characterisation]")
+        st.markdown(
+            "**Oxygen release rate from the PFC source**\n\n"
+            "Track total oxygen within the source region over time. "
+            "The negative derivative is the instantaneous release rate."
+        )
+        st.latex(
+            r"M_{\text{source}}(t) = \int_{\text{source}} C(x,\,t)\; dx"
+        )
+        st.latex(
+            r"\text{Release rate} = -\frac{dM_{\text{source}}}{dt}"
+        )
+        st.latex(
+            r"\text{Fractional release: } F(t) = "
+            r"\frac{M_{\text{source}}(0) - M_{\text{source}}(t)}"
+            r"{M_{\text{source}}(0)} = \frac{M_{\text{released}}(t)}{M_{\text{total}}(\infty)}"
+        )
+        st.markdown(
+            "Source region = central pixels where $C > C_\\infty$ significantly at $t = 0$ (~15\u201320 pixels around peak)\n\n"
+            "$F(t)$ ranges from 0 (no release) to 1 (fully depleted)"
+        )
+        st.info(
+            '**In your meeting:** "We measure how fast the PFC plug releases its stored oxygen. '
+            "A constant release rate (linear M\u209B\u2092\u1D64\u1D63\u1D9C\u1D49 decay) "
+            "is pharmaceutically ideal \u2014 zero-order kinetics. "
+            "If methylcellulose converts the exponential burst into linear "
+            'release, that\u2019s a strong mechanistic result."'
+        )
+        st.markdown("---")
+
+        # --- Metric 5 ---
+        st.markdown("#### :orange[Metric 5 \u2014 mechanistic insight]")
+        st.markdown(
+            "**Korsmeyer-Peppas release model**\n\n"
+            "Fit the fractional release curve to the power-law model. "
+            "The exponent $n$ reveals whether methylcellulose changes the release mechanism."
+        )
+        st.latex(r"F(t) = k \cdot t^{\,n}")
+        st.markdown(
+            "$k$ = release rate constant\n\n"
+            "$n$ = transport exponent (the key parameter)\n\n"
+            "Valid for $F(t) < 0.6$ (first 60% of release)"
+        )
+        col_n1, col_n2, col_n3 = st.columns(3)
+        col_n1.markdown("**$n = 0.5$**\n\nFickian diffusion \u2014 no barrier effect from MC")
+        col_n2.markdown("**$0.5 < n < 1.0$**\n\nAnomalous transport \u2014 mixed diffusion + viscosity barrier")
+        col_n3.markdown("**$n = 1.0$**\n\nZero-order release \u2014 fully barrier-controlled (ideal for therapy)")
+        st.info(
+            '**In your meeting:** "The Korsmeyer-Peppas exponent tells us what methylcellulose is doing mechanistically. '
+            "If $n$ stays at 0.5 regardless of MC concentration, the viscosity is just slowing diffusion \u2014 "
+            "not changing the mechanism. If $n$ increases toward 1.0 with higher MC, it proves that the viscosity "
+            "barrier is fundamentally converting burst release into controlled, "
+            'sustained release. That\u2019s the mechanistic story for the paper."'
+        )
+        st.markdown("---")
+
+        # --- Complementary: first-order ---
+        st.markdown("#### :gray[Complementary \u2014 first-order comparison]")
+        st.markdown(
+            "**First-order (exponential) release model**\n\n"
+            "The baseline model \u2014 simple diffusion-limited release with no barrier. "
+            "Fit this alongside Korsmeyer-Peppas; if it fits better, MC isn\u2019t changing the mechanism."
+        )
+        st.latex(r"C_{\text{excess}}(t) = C_0 \cdot e^{-k_1 t}")
+        st.latex(r"\tau_{1/2} = \frac{\ln 2}{k_1}")
+        st.markdown(
+            "$C_0$ = initial peak excess\n\n"
+            "$k_1$ = first-order rate constant (s\u207b\u00b9)\n\n"
+            "Compare R\u00b2 of this fit vs Korsmeyer-Peppas to determine which model describes your data better."
+        )
+
     # User-tunable thresholds
     cfg1, cfg2 = st.columns(2)
     c_th_excess = cfg1.number_input(
