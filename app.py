@@ -73,6 +73,77 @@ def detect_diffusion_start(data, n_center=40):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# DATASET AVERAGING
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_average_data(datasets):
+    """Average multiple (x, times, data) tuples into a single dataset.
+
+    If spatial grids differ in length, all datasets are linearly
+    interpolated onto the finest common grid.  If time grids differ,
+    the shortest common time span is used.
+
+    Returns
+    -------
+    x_common, times_common, data_mean, data_std, n_datasets
+    """
+    from scipy.interpolate import interp1d
+
+    if len(datasets) == 1:
+        x, t, d = datasets[0]
+        return x, t, d, np.zeros_like(d), 1
+
+    # --- Determine common spatial grid (finest resolution) ---
+    all_x = [ds[0] for ds in datasets]
+    dx_min = min(np.median(np.diff(xx)) for xx in all_x)
+    x_lo = max(xx[0] for xx in all_x)
+    x_hi = min(xx[-1] for xx in all_x)
+    n_pts = max(10, int(np.round((x_hi - x_lo) / dx_min)) + 1)
+    x_common = np.linspace(x_lo, x_hi, n_pts)
+
+    # --- Determine common time grid (shortest span) ---
+    all_t = [ds[1] for ds in datasets]
+    t_max = min(tt[-1] for tt in all_t)
+    # Use the time vector from the dataset with most steps up to t_max
+    t_common = None
+    for tt in all_t:
+        tt_trim = tt[tt <= t_max + 0.1]
+        if t_common is None or len(tt_trim) > len(t_common):
+            t_common = tt_trim
+
+    # --- Interpolate each dataset onto common grid ---
+    stack = []
+    for x_i, t_i, d_i in datasets:
+        # Temporal: pick columns whose time <= t_max
+        t_mask = t_i <= t_max + 0.1
+        d_trim = d_i[:, t_mask]
+        t_trim = t_i[t_mask]
+
+        # If time grids differ in length, interpolate temporally
+        if len(t_trim) != len(t_common) or not np.allclose(t_trim, t_common, atol=1):
+            d_temp = np.zeros((d_trim.shape[0], len(t_common)))
+            for px in range(d_trim.shape[0]):
+                f = interp1d(t_trim, d_trim[px, :], kind="linear",
+                             bounds_error=False, fill_value="extrapolate")
+                d_temp[px, :] = f(t_common)
+            d_trim = d_temp
+
+        # Spatial interpolation onto x_common
+        d_interp = np.zeros((len(x_common), d_trim.shape[1]))
+        for col in range(d_trim.shape[1]):
+            f = interp1d(x_i, d_trim[:, col], kind="linear",
+                         bounds_error=False, fill_value="extrapolate")
+            d_interp[:, col] = f(x_common)
+        stack.append(d_interp)
+
+    cube = np.array(stack)  # shape (n_datasets, n_x, n_t)
+    data_mean = cube.mean(axis=0)
+    data_std = cube.std(axis=0, ddof=1) if cube.shape[0] > 1 else np.zeros_like(data_mean)
+
+    return x_common, t_common, data_mean, data_std, len(datasets)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # METHOD 1: MOMENT (VARIANCE) ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1063,6 +1134,218 @@ def run_analysis(raw_bytes, filename):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# AVERAGED ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+
+def make_avg_profiles_plot(x, times, data_mean, data_std, n_ds, t_start_min):
+    """Profiles with \u00b1 1 std band."""
+    t_min = times / 60
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle(
+        f"Averaged Data (n = {n_ds} replicates, \u00b1 1 SD shading)  |  "
+        f"loading phase removed: first {t_start_min} min",
+        fontsize=12, fontweight="bold",
+    )
+
+    # 1 - Profiles at selected times
+    ax = axes[0]
+    idx = np.linspace(0, len(times) - 1, 8, dtype=int)
+    for i in idx:
+        ax.plot(x, data_mean[:, i], lw=1.2, label=f"{t_min[i]:.0f} min")
+        ax.fill_between(
+            x,
+            data_mean[:, i] - data_std[:, i],
+            data_mean[:, i] + data_std[:, i],
+            alpha=0.15,
+        )
+    ax.set_xlabel("Position (mm)")
+    ax.set_ylabel("O\u2082 (% Air Sat.)")
+    ax.set_title("Mean profiles \u00b1 SD")
+    ax.legend(fontsize=7, ncol=2)
+
+    # 2 - Peak excess with std band over time
+    ax = axes[1]
+    bl = 0.5 * (data_mean[:15, 0].mean() + data_mean[-15:, 0].mean())
+    excess_mean = data_mean - bl
+    peak_mean = excess_mean.max(axis=0)
+    # Approximate peak std from data_std at peak location per timestep
+    peak_idx = excess_mean.argmax(axis=0)
+    peak_std = np.array([data_std[peak_idx[t], t] for t in range(len(times))])
+    ax.plot(t_min, peak_mean, "o-", ms=3, lw=1.2, c="crimson", label="mean peak excess")
+    ax.fill_between(t_min, peak_mean - peak_std, peak_mean + peak_std,
+                    color="crimson", alpha=0.15, label="\u00b1 1 SD")
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("Peak Excess O\u2082")
+    ax.set_title("Peak decay (mean \u00b1 SD)")
+    ax.legend(fontsize=8)
+
+    # 3 - Centre pixel time-trace with std band
+    ax = axes[2]
+    mid = data_mean.shape[0] // 2
+    hw = 5
+    centre_mean = data_mean[mid - hw:mid + hw, :].mean(axis=0)
+    centre_std = data_std[mid - hw:mid + hw, :].mean(axis=0)
+    ax.plot(t_min, centre_mean, "o-", ms=3, lw=1.2, c="steelblue",
+            label="centre (mean \u00b1 SD)")
+    ax.fill_between(t_min, centre_mean - centre_std, centre_mean + centre_std,
+                    color="steelblue", alpha=0.15)
+    ax.set_xlabel("Time (min)")
+    ax.set_ylabel("O\u2082 (% Air Sat.)")
+    ax.set_title("Source-centre time trace")
+    ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    return fig
+
+
+def run_average_analysis(datasets, filenames, all_results):
+    """Run full analysis on the averaged dataset and show results.
+
+    Parameters
+    ----------
+    datasets : list of (x, times, data_raw) tuples (pre-loading-trim)
+    filenames : list of str
+    all_results : list of per-experiment result dicts (for metric spread)
+    """
+    n = len(datasets)
+    st.subheader(f"Averaged Analysis (n = {n} replicates)")
+    st.markdown(
+        f"Datasets: **{', '.join(filenames)}**\n\n"
+        "The raw C(x, t) arrays are interpolated onto a common grid and "
+        "element-wise averaged. All metrics below are computed on the mean "
+        "data. Replicate spread (\u00b1 1 SD) is shown where applicable."
+    )
+
+    # --- Compute average ---
+    x_avg, times_avg, data_mean, data_std, n_ds = compute_average_data(datasets)
+
+    # Detect loading phase on averaged data
+    t_start = detect_diffusion_start(data_mean)
+    t_start_min = t_start * 5
+    st.info(
+        f"Loading phase (on average): first **{t_start_min} min**. "
+        "Using this as effective t = 0."
+    )
+
+    data = data_mean[:, t_start:]
+    data_sd = data_std[:, t_start:]
+    times = times_avg[t_start:] - times_avg[t_start]
+
+    # --- Averaged profile figure ---
+    fig_avg = make_avg_profiles_plot(x_avg, times, data, data_sd, n_ds, t_start_min)
+    st.pyplot(fig_avg)
+    buf = io.BytesIO()
+    fig_avg.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    buf.seek(0)
+    st.download_button("Download averaged profiles (PNG)", buf,
+                       "averaged_profiles.png", "image/png",
+                       key="dl_avg_profiles")
+    plt.close(fig_avg)
+
+    # --- Run standard analysis on the averaged data ---
+    st.markdown("---")
+    st.markdown("### Metrics on Averaged Data")
+
+    mom = method_moments(x_avg, data, times, n_fit_steps=12)
+    pde = method_pde(x_avg, data, times)
+    ret = compute_retention(x_avg, data, times)
+    kin = compute_kinetics_metrics(x_avg, data, times)
+    fits = fit_release_models(times, ret["peak_excess"])
+
+    # Key metrics from averaged data
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("D_moment (avg)", f"{mom['D']:.4e} mm\u00b2/s")
+    col2.metric("D_pde (avg)", f"{pde['D']:.4e} mm\u00b2/s")
+    if not np.isnan(ret["tau_half_peak"]):
+        col3.metric("\u03c4\u00bd (avg)", f"{ret['tau_half_peak'] / 60:.1f} min")
+    else:
+        col3.metric("\u03c4\u00bd (avg)", "N/A")
+    col4.metric("RMSE (avg)", f"{pde['RMSE']:.2f}")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("AUC (avg)", f"{kin['auc_xt']:.1f}")
+    col2.metric("L_p\u2080 (avg)", f"{kin['L_p'][0]:.2f} mm")
+    kp_n = fits["korsmeyer_peppas"]["n"]
+    col3.metric("K-P n (avg)", f"{kp_n:.3f}" if not np.isnan(kp_n) else "N/A")
+    fo_tau = fits["first_order"]["tau_half"]
+    col4.metric("1st-order \u03c4\u00bd (avg)",
+                f"{fo_tau / 60:.1f} min" if not np.isnan(fo_tau) else "N/A")
+
+    # --- Replicate spread table (mean \u00b1 SD from individual results) ---
+    if len(all_results) >= 2:
+        st.markdown("---")
+        st.markdown("### Replicate Spread (mean \u00b1 SD across individual experiments)")
+
+        def _ms(vals, fmt=".4e", scale=1.0):
+            """Format mean \u00b1 SD, skipping NaN."""
+            clean = [v * scale for v in vals if not np.isnan(v)]
+            if not clean:
+                return "N/A"
+            m, s = np.mean(clean), np.std(clean, ddof=1)
+            return f"{m:{fmt}} \u00b1 {s:{fmt}}"
+
+        spread_rows = [
+            {"Metric": "D_moment (mm\u00b2/s)",
+             "Mean \u00b1 SD": _ms([r["D_moment"] for r in all_results])},
+            {"Metric": "D_pde (mm\u00b2/s)",
+             "Mean \u00b1 SD": _ms([r["D_pde"] for r in all_results])},
+            {"Metric": "\u03c4\u00bd peak (min)",
+             "Mean \u00b1 SD": _ms([r["tau_half_peak"] for r in all_results],
+                                   fmt=".1f", scale=1 / 60)},
+            {"Metric": "AUC (%\u00b7mm\u00b7s)",
+             "Mean \u00b1 SD": _ms([r["auc_xt"] for r in all_results], fmt=".1f")},
+            {"Metric": "L_p\u2080 (mm)",
+             "Mean \u00b1 SD": _ms([r["L_p_0"] for r in all_results], fmt=".2f")},
+            {"Metric": "Init. release rate (%\u00b7mm/s)",
+             "Mean \u00b1 SD": _ms([r["release_rate_0"] for r in all_results], fmt=".3f")},
+            {"Metric": "K-P n",
+             "Mean \u00b1 SD": _ms([r["kp_n"] for r in all_results], fmt=".3f")},
+            {"Metric": "1st-order \u03c4\u00bd (min)",
+             "Mean \u00b1 SD": _ms([r["fo_tau_half"] for r in all_results],
+                                   fmt=".1f", scale=1 / 60)},
+            {"Metric": "Peak excess (t=0)",
+             "Mean \u00b1 SD": _ms([r["peak_excess_0"] for r in all_results], fmt=".1f")},
+            {"Metric": "FWHM\u2080 (mm)",
+             "Mean \u00b1 SD": _ms([r["fwhm_0"] for r in all_results], fmt=".2f")},
+        ]
+        st.table(pd.DataFrame(spread_rows))
+
+    # --- Diagnostic plots on averaged data ---
+    st.markdown("---")
+    st.markdown("### Diagnostic Plots (on averaged data)")
+    fig = make_plots(x_avg, times, data, mom, pde, ret, t_start_min)
+    st.pyplot(fig)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    buf.seek(0)
+    st.download_button("Download avg. diffusion plots (PNG)", buf,
+                       "avg_diffusion_plots.png", "image/png",
+                       key="dl_avg_diff")
+    plt.close(fig)
+
+    # Kinetics plots
+    st.markdown("### Kinetics Plots (on averaged data)")
+    fig_kin = make_kinetics_plots(x_avg, times, data, ret, kin, fits)
+    st.pyplot(fig_kin)
+    buf = io.BytesIO()
+    fig_kin.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    buf.seek(0)
+    st.download_button("Download avg. kinetics plots (PNG)", buf,
+                       "avg_kinetics_plots.png", "image/png",
+                       key="dl_avg_kin")
+    plt.close(fig_kin)
+
+    if not np.isnan(kp_n):
+        mech = classify_kp_mechanism(kp_n)
+        if kp_n > 0.85:
+            st.success(f"Averaged K-P n = {kp_n:.3f} \u2192 {mech}")
+        elif kp_n > 0.55:
+            st.info(f"Averaged K-P n = {kp_n:.3f} \u2192 {mech}")
+        else:
+            st.warning(f"Averaged K-P n = {kp_n:.3f} \u2192 {mech}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # MULTI-EXPERIMENT COMPARISON
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1321,9 +1604,9 @@ st.set_page_config(
 st.title("\U0001f9ea Diffusion Coefficient (D) Analyzer")
 st.markdown(
     "Upload one or more **CSV** or **Excel** files containing 1D oxygen "
-    "cross-section data. Each file is analysed independently, and when "
-    "multiple files are uploaded, **comparison plots** of D coefficients, "
-    "half-life, and other metrics are generated automatically."
+    "cross-section data. Each file is analysed independently. "
+    "When multiple files are uploaded you also get an **averaged analysis** "
+    "(mean \u00b1 SD) and **cross-experiment comparison** plots."
 )
 
 with st.expander("Expected file format"):
@@ -1348,24 +1631,68 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    # Collect results from each experiment for comparison
+    n_files = len(uploaded_files)
+
+    # Pre-parse all files so we can build tabs
+    raw_data_list = []   # list of (raw_bytes, filename)
+    parsed_datasets = [] # list of (x, times, data_raw)  — for averaging
+    for uploaded in uploaded_files:
+        raw = uploaded.getvalue()
+        raw_data_list.append((raw, uploaded.name))
+        try:
+            parsed_datasets.append(load_data_from_bytes(raw, uploaded.name))
+        except Exception:
+            parsed_datasets.append(None)
+
+    # --- Build tabs ---
+    tab_labels = [f"\U0001f4c4 {uploaded.name}" for uploaded in uploaded_files]
+    if n_files >= 2:
+        tab_labels += ["\U0001f4ca Average (mean \u00b1 SD)", "\U0001f50d Comparison"]
+    tabs = st.tabs(tab_labels)
+
     all_results = []
 
-    for uploaded in uploaded_files:
-        raw_bytes = uploaded.getvalue()
-        st.markdown("---")
-        st.header(f"Experiment: {uploaded.name}")
-        try:
-            result = run_analysis(raw_bytes, uploaded.name)
-            if result is not None:
-                all_results.append(result)
-        except Exception as e:
-            st.error(f"Analysis failed for {uploaded.name}: {e}")
-            st.exception(e)
+    # --- Individual experiment tabs ---
+    for i, tab in enumerate(tabs[:n_files]):
+        with tab:
+            raw_bytes, fname = raw_data_list[i]
+            st.header(f"Experiment: {fname}")
+            try:
+                result = run_analysis(raw_bytes, fname)
+                if result is not None:
+                    all_results.append(result)
+            except Exception as e:
+                st.error(f"Analysis failed for {fname}: {e}")
+                st.exception(e)
 
-    # --- Multi-experiment comparison ---
-    if len(all_results) >= 2:
-        st.markdown("---")
-        make_comparison_section(all_results)
+    # --- Average & Comparison tabs (only for 2+ files) ---
+    if n_files >= 2:
+        # Filter to successfully parsed datasets
+        valid = [(ds, raw_data_list[i][1])
+                 for i, ds in enumerate(parsed_datasets) if ds is not None]
+        valid_datasets = [v[0] for v in valid]
+        valid_names = [v[1] for v in valid]
+
+        # Average tab
+        with tabs[n_files]:
+            if len(valid_datasets) >= 2:
+                try:
+                    run_average_analysis(valid_datasets, valid_names, all_results)
+                except Exception as e:
+                    st.error(f"Averaging failed: {e}")
+                    st.exception(e)
+            else:
+                st.warning(
+                    "Need at least 2 successfully parsed datasets to compute an average."
+                )
+
+        # Comparison tab
+        with tabs[n_files + 1]:
+            if len(all_results) >= 2:
+                make_comparison_section(all_results)
+            else:
+                st.warning(
+                    "Need at least 2 successfully analysed datasets for comparison."
+                )
 else:
     st.info("Upload one or more files to get started.")
