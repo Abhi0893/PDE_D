@@ -30,33 +30,89 @@ _trapz = getattr(np, "trapezoid", None) or np.trapz  # type: ignore[attr-defined
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_data_from_bytes(raw_bytes: bytes, filename: str):
-    """Parse uploaded file → positions (mm), times (s), C(x,t) matrix."""
+    """Parse uploaded file → positions (mm), times (s), C(x,t) matrix.
+
+    Handles common Excel/CSV quirks:
+      - Trailing empty rows
+      - Rows with NaN/blank positions (skipped)
+      - NaN values in data cells (forward-filled, then zero-filled)
+      - Timestamps as strings ("HH:MM:SS") or datetime.time objects
+    """
 
     if filename.endswith((".xlsx", ".xls")):
         df = pd.read_excel(io.BytesIO(raw_bytes), header=None)
-        rows = df.astype(str).values.tolist()
+        rows = df.values.tolist()           # keep native types
     else:
         text = raw_bytes.decode("utf-8-sig")
         rows = list(csv.reader(io.StringIO(text)))
 
-    # Row 0: timestamps (HH:MM:SS) starting at column 2
+    # Row 0: timestamps (HH:MM:SS or datetime.time) starting at column 2
     time_strs = rows[0][2:]
     times = []
     for ts in time_strs:
-        parts = ts.strip().split(":")
-        times.append(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
+        ts_str = str(ts).strip()
+        if ts_str in ("", "nan", "None", "NaT"):
+            continue
+        # Handle datetime.time objects from Excel
+        import datetime
+        if isinstance(ts, datetime.time):
+            times.append(ts.hour * 3600 + ts.minute * 60 + ts.second)
+            continue
+        parts = ts_str.split(":")
+        if len(parts) == 3:
+            times.append(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
+        elif len(parts) == 2:
+            times.append(int(parts[0]) * 3600 + int(parts[1]) * 60)
+        else:
+            # Try as raw seconds
+            times.append(float(ts_str))
     times = np.array(times, dtype=float)
 
     # Row 1: header row (skip)
     # Rows 2+: pixel_index, position_mm, O2 values …
+    n_times = len(times)
     positions, profiles = [], []
     for row in rows[2:]:
         if len(row) < 3:
             continue
-        positions.append(float(row[1]))
-        profiles.append([float(v) for v in row[2:]])
+        # Skip rows where position is missing/NaN
+        pos_str = str(row[1]).strip()
+        if pos_str in ("", "nan", "None"):
+            continue
+        try:
+            pos = float(pos_str)
+        except (ValueError, TypeError):
+            continue
+        if np.isnan(pos):
+            continue
 
-    return np.array(positions), times, np.array(profiles)
+        # Parse data values, converting blanks/NaN to np.nan
+        vals = []
+        for v in row[2:2 + n_times]:
+            try:
+                fv = float(v)
+            except (ValueError, TypeError):
+                fv = np.nan
+            vals.append(fv)
+        # Pad if row is shorter than expected
+        while len(vals) < n_times:
+            vals.append(np.nan)
+
+        positions.append(pos)
+        profiles.append(vals)
+
+    positions = np.array(positions)
+    profiles = np.array(profiles)
+
+    # Handle any remaining NaN in data: forward-fill along time, then backfill
+    if np.isnan(profiles).any():
+        prof_df = pd.DataFrame(profiles)
+        prof_df = prof_df.ffill(axis=1).bfill(axis=1)
+        # If entire rows are NaN (shouldn't happen after pos filter), fill with 0
+        prof_df = prof_df.fillna(0.0)
+        profiles = prof_df.values
+
+    return positions, times, profiles
 
 
 # ═══════════════════════════════════════════════════════════════════════
