@@ -314,12 +314,19 @@ def method_pde(x, data, times, D_bounds=(1e-6, 5e-2), n_bc=10):
 # RETENTION METRICS
 # ═══════════════════════════════════════════════════════════════════════
 
-def compute_retention(x, data, times, n_edge=15):
-    bl = 0.5 * (data[:n_edge, 0].mean() + data[-n_edge:, 0].mean())
+def compute_retention(x, data, times, n_edge=15, baseline=None):
+    bl = baseline if baseline is not None else 0.5 * (data[:n_edge, 0].mean() + data[-n_edge:, 0].mean())
     excess = data - bl
     dx = np.median(np.diff(x))
+    N = data.shape[0]
 
-    peak_excess = excess.max(axis=0)
+    # Fixed centre region (±5 px around peak at t=0) instead of roaming max
+    peak_px = int(np.argmax(data[:, 0]))
+    half_w = 5
+    lo = max(0, peak_px - half_w)
+    hi = min(N, peak_px + half_w + 1)
+    peak_excess = excess[lo:hi, :].mean(axis=0)
+    peak_conc = data[lo:hi, :].mean(axis=0)
     total_excess = np.sum(np.maximum(excess, 0), axis=0) * dx
 
     fwhm = np.full(len(times), np.nan)
@@ -338,9 +345,33 @@ def compute_retention(x, data, times, n_edge=15):
             tau_half = times[i - 1] + frac * (times[i] - times[i - 1])
             break
 
+    # Biphasic detection: smoothed release rate and handoff time
+    t_handoff = np.nan
+    rr_at_0 = np.nan
+    rr_at_peak = np.nan
+    is_biphasic = False
+    if len(times) >= 5:
+        pe_smooth = np.convolve(peak_excess, np.ones(3) / 3, mode="valid")
+        t_smooth = times[1:-1]
+        release_rate_curve = -np.gradient(pe_smooth, t_smooth)
+        rr_peak_idx = int(np.argmax(release_rate_curve))
+        t_handoff = t_smooth[rr_peak_idx]
+        rr_at_0 = float(release_rate_curve[0])
+        rr_at_peak = float(release_rate_curve[rr_peak_idx])
+        is_biphasic = t_handoff > 600  # >10 min after diffusion start
+
+    # T_eff: time above absolute therapeutic threshold (default 150% Air Sat)
+    dt = times[1] - times[0] if len(times) > 1 else 300.0
+    T_eff_150 = float(np.sum(peak_conc > 150.0) * dt / 60)  # minutes
+
     return {
-        "peak_excess": peak_excess, "total_excess": total_excess,
+        "peak_excess": peak_excess, "peak_conc": peak_conc,
+        "total_excess": total_excess,
         "fwhm": fwhm, "tau_half_peak": tau_half, "baseline": bl,
+        "peak_px": peak_px, "centre_lo": lo, "centre_hi": hi,
+        "t_handoff": t_handoff, "rr_at_0": rr_at_0,
+        "rr_at_peak": rr_at_peak, "is_biphasic": is_biphasic,
+        "T_eff_150": T_eff_150,
     }
 
 
@@ -469,24 +500,21 @@ def _safe_r2(y, y_pred):
 
 
 def fit_release_models(times, peak_excess):
-    """Fit first-order, Korsmeyer-Peppas, and Higuchi release models to
-    the peak-excess decay curve.
+    """Fit first-order exponential model to the peak-excess decay curve.
 
-    peak_excess is used as a proxy for remaining "undelivered" oxygen in
-    the source. Fractional release is M(t)/M_inf = 1 - C_ex(t)/C_ex(0).
-
-    Returns dict with fitted parameters and R^2 for each model. Any model
-    that fails to fit is reported with NaNs.
+    Returns dict with fitted parameters, R^2, and residual pattern
+    analysis (early/mid/late) to assess model adequacy.
     """
     t = np.asarray(times, dtype=float)
     pe = np.asarray(peak_excess, dtype=float)
 
-    nan_fo = {"C0": np.nan, "k": np.nan, "R2": np.nan, "tau_half": np.nan}
-    nan_kp = {"k": np.nan, "n": np.nan, "R2": np.nan, "n_points": 0}
-    nan_hi = {"k_H": np.nan, "R2": np.nan}
+    nan_fo = {
+        "C0": np.nan, "k": np.nan, "R2": np.nan, "tau_half": np.nan,
+        "resid_early": np.nan, "resid_mid": np.nan, "resid_late": np.nan,
+    }
 
     if len(t) < 3 or pe[0] <= 0:
-        return {"first_order": nan_fo, "korsmeyer_peppas": nan_kp, "higuchi": nan_hi}
+        return {"first_order": nan_fo}
 
     results = {}
 
@@ -503,74 +531,24 @@ def fit_release_models(times, peak_excess):
         pred = C0_fo * np.exp(-k_fo * t)
         R2_fo = _safe_r2(pe, pred)
         tau_fo = float(np.log(2) / k_fo) if k_fo > 0 else np.nan
+
+        # Residual pattern: early / mid / late
+        n_td = len(t)
+        n5 = max(1, n_td // 5)
+        residuals = pe - pred
+        resid_early = float(residuals[:n5].mean())
+        resid_mid = float(residuals[n5:3 * n5].mean())
+        resid_late = float(residuals[3 * n5:].mean())
+
         results["first_order"] = {
             "C0": C0_fo, "k": k_fo, "R2": R2_fo, "tau_half": tau_fo,
+            "resid_early": resid_early, "resid_mid": resid_mid,
+            "resid_late": resid_late,
         }
     except Exception:
         results["first_order"] = dict(nan_fo)
 
-    # ---- Fractional release ----
-    frac_rel = 1.0 - pe / pe[0]
-    frac_rel = np.clip(frac_rel, 0.0, 1.0)
-
-    # ---- Korsmeyer-Peppas: M/M_inf = k * t^n, valid for M/M_inf < 0.6 ----
-    mask_kp = (t > 0) & (frac_rel > 1e-4) & (frac_rel < 0.6)
-    if mask_kp.sum() >= 3:
-        try:
-            popt, _ = curve_fit(
-                lambda tt, k, n: k * np.power(tt, n),
-                t[mask_kp], frac_rel[mask_kp],
-                p0=[1e-3, 0.5],
-                bounds=([0.0, 0.05], [10.0, 2.0]),
-                maxfev=5000,
-            )
-            k_kp, n_kp = float(popt[0]), float(popt[1])
-            pred = k_kp * np.power(t[mask_kp], n_kp)
-            R2_kp = _safe_r2(frac_rel[mask_kp], pred)
-            results["korsmeyer_peppas"] = {
-                "k": k_kp, "n": n_kp, "R2": R2_kp, "n_points": int(mask_kp.sum()),
-            }
-        except Exception:
-            results["korsmeyer_peppas"] = dict(nan_kp)
-    else:
-        results["korsmeyer_peppas"] = dict(nan_kp)
-
-    # ---- Higuchi: M/M_inf = k_H * sqrt(t) ----
-    mask_h = t > 0
-    if mask_h.sum() >= 3:
-        try:
-            popt, _ = curve_fit(
-                lambda tt, k_H: k_H * np.sqrt(tt),
-                t[mask_h], frac_rel[mask_h],
-                p0=[1e-3],
-                bounds=([0.0], [10.0]),
-                maxfev=5000,
-            )
-            k_H = float(popt[0])
-            pred = k_H * np.sqrt(t[mask_h])
-            R2_h = _safe_r2(frac_rel[mask_h], pred)
-            results["higuchi"] = {"k_H": k_H, "R2": R2_h}
-        except Exception:
-            results["higuchi"] = dict(nan_hi)
-    else:
-        results["higuchi"] = dict(nan_hi)
-
     return results
-
-
-def classify_kp_mechanism(n):
-    """Return a short mechanistic label for the Korsmeyer-Peppas exponent."""
-    if n is None or np.isnan(n):
-        return "N/A"
-    if n < 0.45:
-        return "Sub-Fickian (n<0.45)"
-    if n < 0.55:
-        return "Fickian diffusion (n\u22480.5)"
-    if n < 0.95:
-        return "Anomalous transport (0.5<n<1)"
-    if n < 1.05:
-        return "Zero-order / Case II (n\u22481)"
-    return "Super Case II (n>1)"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -819,6 +797,10 @@ def run_analysis(raw_bytes, filename):
     data = data_raw[:, t_start:]
     times = times_raw[t_start:] - times_raw[t_start]
 
+    # Baseline from RAW t=0 (before loading trim) — fix per clean_metrics.py
+    n_edge = 15
+    raw_baseline = 0.5 * (data_raw[:n_edge, 0].mean() + data_raw[-n_edge:, 0].mean())
+
     # --- Method 1: Moments ---
     st.subheader("Method 1: Variance (Moment) Analysis")
     with st.spinner("Computing moments..."):
@@ -846,24 +828,39 @@ def run_analysis(raw_bytes, filename):
 
     # --- Retention ---
     st.subheader("Retention Metrics")
-    ret = compute_retention(x, data, times)
+    ret = compute_retention(x, data, times, baseline=raw_baseline)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Peak excess (t=0)", f"{ret['peak_excess'][0]:.1f}")
-    col2.metric("Peak excess (t=end)", f"{ret['peak_excess'][-1]:.1f}")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("C_peak\u2070 (absolute)", f"{ret['peak_conc'][0]:.1f} % Air Sat")
+    col2.metric("C_excess(0)", f"{ret['peak_excess'][0]:.1f}")
     if not np.isnan(ret["tau_half_peak"]):
-        col3.metric("\u03c4_half_peak", f"{ret['tau_half_peak'] / 60:.1f} min")
+        col3.metric("\u03c4\u00bd", f"{ret['tau_half_peak'] / 60:.1f} min")
+    else:
+        col3.metric("\u03c4\u00bd", "N/A")
+    col4.metric("T_eff (>150%)", f"{ret['T_eff_150']:.0f} min")
+
     fwhm_valid = ret["fwhm"][~np.isnan(ret["fwhm"])]
+    c1, c2, c3 = st.columns(3)
     if len(fwhm_valid) > 0:
-        c1, c2 = st.columns(2)
-        c1.metric("FWHM (t=0)", f"{ret['fwhm'][0]:.2f} mm")
+        c1.metric("FWHM\u2080", f"{ret['fwhm'][0]:.2f} mm")
         c2.metric("FWHM (t=end)", f"{fwhm_valid[-1]:.2f} mm")
+    c3.metric("Baseline (raw t=0)", f"{ret['baseline']:.1f} % Air Sat")
+
+    # Biphasic detection
+    if not np.isnan(ret["t_handoff"]):
+        bip_label = "YES" if ret["is_biphasic"] else "NO"
+        bip_color = "success" if ret["is_biphasic"] else "warning"
+        getattr(st, bip_color)(
+            f"**Biphasic release: {bip_label}** \u2014 "
+            f"t_handoff = {ret['t_handoff'] / 60:.1f} min  |  "
+            f"R(0) = {ret['rr_at_0']:.4f}  |  R(peak) = {ret['rr_at_peak']:.4f}"
+        )
 
     if not np.isnan(ret["tau_half_peak"]):
-        st.success(
-            f"\u03c4_half_peak = {ret['tau_half_peak']:.0f} s "
+        st.info(
+            f"\u03c4\u00bd = {ret['tau_half_peak']:.0f} s "
             f"({ret['tau_half_peak'] / 60:.1f} min) \u2014 "
-            "higher means the material stays oxygenated longer."
+            f"Peak tracked via fixed centre region (\u00b15 px around pixel {ret['peak_px']})"
         )
 
     # --- Release Kinetics (5 metrics + 3 model fits) ---
@@ -1057,51 +1054,43 @@ def run_analysis(raw_bytes, filename):
         help="Metric 5: -dM_source/dt at t=0.",
     )
 
-    # Model fits
-    st.markdown("**Release-kinetics model fits** (fit on peak excess decay)")
+    # First-order model fit + residual analysis
+    st.markdown("**First-order model fit** (C\u2080 \u00b7 e^(-k\u2081t) on centre-region peak excess)")
     fo = fits["first_order"]
-    kp = fits["korsmeyer_peppas"]
-    hi = fits["higuchi"]
 
-    fit_rows = [
-        {
-            "Model": "First-order  C\u2080 e^(-kt)",
-            "Param 1": f"k = {fo['k']:.4e} s\u207b\u00b9" if not np.isnan(fo["k"]) else "N/A",
-            "Param 2": f"\u03c4\u00bd = {fo['tau_half']/60:.1f} min" if not np.isnan(fo["tau_half"]) else "N/A",
-            "R\u00b2": f"{fo['R2']:.3f}" if not np.isnan(fo["R2"]) else "N/A",
-        },
-        {
-            "Model": "Korsmeyer-Peppas  k t\u207f",
-            "Param 1": f"k = {kp['k']:.4e}" if not np.isnan(kp["k"]) else "N/A",
-            "Param 2": f"n = {kp['n']:.3f} ({classify_kp_mechanism(kp['n'])})" if not np.isnan(kp["n"]) else "N/A",
-            "R\u00b2": f"{kp['R2']:.3f}" if not np.isnan(kp["R2"]) else "N/A",
-        },
-        {
-            "Model": "Higuchi  k_H \u221at",
-            "Param 1": f"k_H = {hi['k_H']:.4e} s^-\u00bd" if not np.isnan(hi["k_H"]) else "N/A",
-            "Param 2": "\u2014",
-            "R\u00b2": f"{hi['R2']:.3f}" if not np.isnan(hi["R2"]) else "N/A",
-        },
-    ]
+    fit_rows = [{
+        "k\u2081 (s\u207b\u00b9)": f"{fo['k']:.4e}" if not np.isnan(fo["k"]) else "N/A",
+        "1st-order \u03c4\u00bd (min)": f"{fo['tau_half']/60:.1f}" if not np.isnan(fo["tau_half"]) else "N/A",
+        "R\u00b2": f"{fo['R2']:.4f}" if not np.isnan(fo["R2"]) else "N/A",
+        "Resid. early": f"{fo['resid_early']:+.1f}" if not np.isnan(fo.get("resid_early", np.nan)) else "N/A",
+        "Resid. mid": f"{fo['resid_mid']:+.1f}" if not np.isnan(fo.get("resid_mid", np.nan)) else "N/A",
+        "Resid. late": f"{fo['resid_late']:+.1f}" if not np.isnan(fo.get("resid_late", np.nan)) else "N/A",
+    }]
     st.table(pd.DataFrame(fit_rows))
 
-    if not np.isnan(kp["n"]):
-        if kp["n"] > 0.85:
-            st.success(
-                f"K-P exponent n = {kp['n']:.2f} \u2192 release is approaching "
-                "barrier-controlled (Case II) kinetics. Strong evidence the matrix "
-                "is converting diffusion-limited release into sustained release."
-            )
-        elif kp["n"] > 0.55:
-            st.info(
-                f"K-P exponent n = {kp['n']:.2f} \u2192 anomalous transport "
-                "(mixed Fickian + barrier control)."
-            )
-        else:
-            st.warning(
-                f"K-P exponent n = {kp['n']:.2f} \u2192 Fickian (diffusion-limited) "
-                "release. The matrix is not (yet) creating a meaningful barrier."
-            )
+    # MC extension beyond simple diffusion
+    if not np.isnan(ret["tau_half_peak"]) and not np.isnan(fo["tau_half"]):
+        actual = ret["tau_half_peak"] / 60
+        predicted = fo["tau_half"] / 60
+        if predicted > 0:
+            extension_pct = (actual / predicted - 1) * 100
+            if extension_pct > 10:
+                st.success(
+                    f"MC extends delivery by **{extension_pct:.0f}%** beyond simple diffusion "
+                    f"(actual \u03c4\u00bd = {actual:.1f} min vs 1st-order prediction = {predicted:.1f} min)"
+                )
+            else:
+                st.info(
+                    f"Actual \u03c4\u00bd = {actual:.1f} min vs 1st-order = {predicted:.1f} min "
+                    f"(extension: {extension_pct:+.0f}%)"
+                )
+
+    if not np.isnan(fo["R2"]) and fo["R2"] < 0.95:
+        st.warning(
+            f"First-order R\u00b2 = {fo['R2']:.3f} < 0.95 \u2192 simple exponential "
+            "is a poor fit. This supports the hypothesis that the release mechanism "
+            "is NOT pure Fickian diffusion."
+        )
 
     # Kinetics plots
     fig_kin = make_kinetics_plots(x, times, data, ret, kin, fits)
@@ -1181,11 +1170,11 @@ def run_analysis(raw_bytes, filename):
         "fo_k": fits["first_order"]["k"],
         "fo_tau_half": fits["first_order"]["tau_half"],
         "fo_R2": fits["first_order"]["R2"],
-        "kp_k": fits["korsmeyer_peppas"]["k"],
-        "kp_n": fits["korsmeyer_peppas"]["n"],
-        "kp_R2": fits["korsmeyer_peppas"]["R2"],
-        "hi_k": fits["higuchi"]["k_H"],
-        "hi_R2": fits["higuchi"]["R2"],
+        # Biphasic & T_eff
+        "t_handoff": ret["t_handoff"],
+        "is_biphasic": ret["is_biphasic"],
+        "T_eff_150": ret["T_eff_150"],
+        "C_peak_0": ret["peak_conc"][0],
     }
 
 
@@ -1321,8 +1310,7 @@ def run_average_analysis(datasets, filenames, all_results):
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("AUC (avg)", f"{kin['auc_xt']:.1f}")
     col2.metric("L_p\u2080 (avg)", f"{kin['L_p'][0]:.2f} mm")
-    kp_n = fits["korsmeyer_peppas"]["n"]
-    col3.metric("K-P n (avg)", f"{kp_n:.3f}" if not np.isnan(kp_n) else "N/A")
+    col3.metric("T_eff >150% (avg)", f"{ret['T_eff_150']:.0f} min")
     fo_tau = fits["first_order"]["tau_half"]
     col4.metric("1st-order \u03c4\u00bd (avg)",
                 f"{fo_tau / 60:.1f} min" if not np.isnan(fo_tau) else "N/A")
@@ -1341,28 +1329,26 @@ def run_average_analysis(datasets, filenames, all_results):
             return f"{m:{fmt}} \u00b1 {s:{fmt}}"
 
         spread_rows = [
-            {"Metric": "D_moment (mm\u00b2/s)",
-             "Mean \u00b1 SD": _ms([r["D_moment"] for r in all_results])},
-            {"Metric": "D_pde (mm\u00b2/s)",
-             "Mean \u00b1 SD": _ms([r["D_pde"] for r in all_results])},
-            {"Metric": "\u03c4\u00bd peak (min)",
+            {"Metric": "\u03c4\u00bd (min)",
              "Mean \u00b1 SD": _ms([r["tau_half_peak"] for r in all_results],
                                    fmt=".1f", scale=1 / 60)},
-            {"Metric": "AUC (%\u00b7mm\u00b7s)",
-             "Mean \u00b1 SD": _ms([r["auc_xt"] for r in all_results], fmt=".1f")},
-            {"Metric": "L_p\u2080 (mm)",
-             "Mean \u00b1 SD": _ms([r["L_p_0"] for r in all_results], fmt=".2f")},
-            {"Metric": "Init. release rate (%\u00b7mm/s)",
-             "Mean \u00b1 SD": _ms([r["release_rate_0"] for r in all_results], fmt=".3f")},
-            {"Metric": "K-P n",
-             "Mean \u00b1 SD": _ms([r["kp_n"] for r in all_results], fmt=".3f")},
             {"Metric": "1st-order \u03c4\u00bd (min)",
              "Mean \u00b1 SD": _ms([r["fo_tau_half"] for r in all_results],
                                    fmt=".1f", scale=1 / 60)},
-            {"Metric": "Peak excess (t=0)",
-             "Mean \u00b1 SD": _ms([r["peak_excess_0"] for r in all_results], fmt=".1f")},
+            {"Metric": "1st-order R\u00b2",
+             "Mean \u00b1 SD": _ms([r["fo_R2"] for r in all_results], fmt=".4f")},
+            {"Metric": "C_peak\u2070 (% Air Sat)",
+             "Mean \u00b1 SD": _ms([r.get("C_peak_0", r["peak_excess_0"]) for r in all_results], fmt=".1f")},
+            {"Metric": "AUC (%\u00b7mm\u00b7s)",
+             "Mean \u00b1 SD": _ms([r["auc_xt"] for r in all_results], fmt=".1f")},
+            {"Metric": "T_eff >150% (min)",
+             "Mean \u00b1 SD": _ms([r.get("T_eff_150", 0) for r in all_results], fmt=".0f")},
+            {"Metric": "L_p\u2080 (mm)",
+             "Mean \u00b1 SD": _ms([r["L_p_0"] for r in all_results], fmt=".2f")},
             {"Metric": "FWHM\u2080 (mm)",
              "Mean \u00b1 SD": _ms([r["fwhm_0"] for r in all_results], fmt=".2f")},
+            {"Metric": "D_pde (mm\u00b2/s)",
+             "Mean \u00b1 SD": _ms([r["D_pde"] for r in all_results])},
         ]
         st.table(pd.DataFrame(spread_rows))
 
@@ -1391,14 +1377,15 @@ def run_average_analysis(datasets, filenames, all_results):
                        key="dl_avg_kin")
     plt.close(fig_kin)
 
-    if not np.isnan(kp_n):
-        mech = classify_kp_mechanism(kp_n)
-        if kp_n > 0.85:
-            st.success(f"Averaged K-P n = {kp_n:.3f} \u2192 {mech}")
-        elif kp_n > 0.55:
-            st.info(f"Averaged K-P n = {kp_n:.3f} \u2192 {mech}")
+    fo = fits["first_order"]
+    if not np.isnan(fo["R2"]):
+        if fo["R2"] < 0.95:
+            st.warning(
+                f"Averaged 1st-order R\u00b2 = {fo['R2']:.3f} < 0.95 \u2192 "
+                "simple exponential is a poor fit on averaged data."
+            )
         else:
-            st.warning(f"Averaged K-P n = {kp_n:.3f} \u2192 {mech}")
+            st.info(f"Averaged 1st-order R\u00b2 = {fo['R2']:.3f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1434,16 +1421,20 @@ def make_comparison_section(all_results):
     for r in all_results:
         kin_rows.append({
             "Experiment": r["label"],
-            "AUC (%\u00b7mm\u00b7s)": f"{r['auc_xt']:.1f}",
-            "L_p\u2080 (mm)": f"{r['L_p_0']:.2f}",
-            "L_p_end (mm)": f"{r['L_p_end']:.2f}",
-            "Init. release (%\u00b7mm/s)": f"{r['release_rate_0']:.3f}",
+            "C_peak\u2070": f"{r['C_peak_0']:.1f}",
+            "\u03c4\u00bd (min)": (
+                f"{r['tau_half_peak']/60:.1f}" if not np.isnan(r["tau_half_peak"]) else "N/A"
+            ),
             "1st-order \u03c4\u00bd (min)": (
                 f"{r['fo_tau_half']/60:.1f}" if not np.isnan(r["fo_tau_half"]) else "N/A"
             ),
-            "K-P n": f"{r['kp_n']:.3f}" if not np.isnan(r["kp_n"]) else "N/A",
-            "K-P R\u00b2": f"{r['kp_R2']:.3f}" if not np.isnan(r["kp_R2"]) else "N/A",
-            "Mechanism": classify_kp_mechanism(r["kp_n"]),
+            "1st-order R\u00b2": f"{r['fo_R2']:.4f}" if not np.isnan(r["fo_R2"]) else "N/A",
+            "AUC": f"{r['auc_xt']:.1f}",
+            "T_eff (min)": f"{r['T_eff_150']:.0f}",
+            "Biphasic": "YES" if r.get("is_biphasic") else "NO",
+            "t_handoff (min)": (
+                f"{r['t_handoff']/60:.1f}" if not np.isnan(r.get("t_handoff", np.nan)) else "N/A"
+            ),
         })
     st.table(pd.DataFrame(kin_rows))
 
@@ -1562,21 +1553,17 @@ def make_comparison_section(all_results):
         if v > 0:
             ax.text(i, v, f"{v:.1f}", ha="center", va="bottom", fontsize=8)
 
-    # 3 - Korsmeyer-Peppas n
+    # 3 - T_eff (time above 150% Air Sat)
     ax = axes3[2]
-    n_vals = [r["kp_n"] if not np.isnan(r["kp_n"]) else 0 for r in all_results]
-    ax.bar(x_pos, n_vals, color=colors)
-    ax.axhline(0.5, color="gray", ls="--", lw=1, label="Fickian (n=0.5)")
-    ax.axhline(1.0, color="red", ls="--", lw=1, label="Zero-order (n=1)")
+    teff_vals = [r.get("T_eff_150", 0) for r in all_results]
+    ax.bar(x_pos, teff_vals, color=colors)
     ax.set_xticks(x_pos)
     ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel("Korsmeyer-Peppas n")
-    ax.set_title("K-P transport exponent")
-    ax.set_ylim(0, max(1.2, max(n_vals + [0]) * 1.1))
-    ax.legend(fontsize=8)
-    for i, v in enumerate(n_vals):
+    ax.set_ylabel("T_eff (min)")
+    ax.set_title("Time above 150% Air Sat")
+    for i, v in enumerate(teff_vals):
         if v > 0:
-            ax.text(i, v, f"{v:.2f}", ha="center", va="bottom", fontsize=8)
+            ax.text(i, v, f"{v:.0f}", ha="center", va="bottom", fontsize=8)
 
     plt.tight_layout()
     st.pyplot(fig3)
