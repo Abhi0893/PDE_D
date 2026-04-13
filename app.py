@@ -684,11 +684,16 @@ if uploaded_files:
             st.error(f"Analysis failed: {e}")
             st.exception(e)
     else:
-        # Multiple files: tabs per replicate + summary
-        tab_labels = [f.name for f in uploaded_files] + ["Summary"]
+        # Multiple files: tabs per replicate + averaged + summary
+        tab_labels = [f.name for f in uploaded_files] + [
+            "\U0001f4ca Averaged (mean \u00b1 SD)", "\U0001f4cb Summary",
+        ]
         tabs = st.tabs(tab_labels)
 
-        for i, tab in enumerate(tabs[:-1]):
+        n_files = len(uploaded_files)
+        parsed_datasets = []  # (x, times, data_raw) for averaging
+
+        for i, tab in enumerate(tabs[:n_files]):
             with tab:
                 raw = uploaded_files[i].getvalue()
                 fname = uploaded_files[i].name
@@ -696,11 +701,139 @@ if uploaded_files:
                 try:
                     m = run_analysis(raw, fname)
                     all_m.append(m)
+                    # Also parse raw data for averaging
+                    parsed_datasets.append(
+                        load_data_from_bytes(raw, fname)
+                    )
                 except Exception as e:
                     st.error(f"Analysis failed for {fname}: {e}")
                     st.exception(e)
 
-        with tabs[-1]:
+        # Averaged tab
+        with tabs[n_files]:
+            if len(parsed_datasets) >= 2:
+                st.header(f"Averaged Analysis (n = {len(parsed_datasets)} replicates)")
+                try:
+                    x_avg, t_avg, d_mean, d_std, n_ds = compute_average_data(
+                        parsed_datasets
+                    )
+                    st.caption(
+                        f"Datasets interpolated onto common grid: "
+                        f"{d_mean.shape[0]} pixels \u00d7 {d_mean.shape[1]} timesteps"
+                    )
+
+                    # Run patent metrics on the averaged data
+                    m_avg = compute_patent_metrics(x_avg, d_mean, t_avg)
+
+                    # Show 4 headline cards
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric(
+                        "\u03c4\u00bd (averaged)",
+                        f"{m_avg['tau_half_min']:.1f} min" if not np.isnan(m_avg["tau_half_min"]) else "N/A",
+                    )
+                    c2.metric(
+                        "t_handoff (averaged)",
+                        f"{m_avg['t_handoff_min']:.1f} min" if not np.isnan(m_avg["t_handoff_min"]) else "N/A",
+                        delta="BIPHASIC" if m_avg["is_biphasic"] else "monophasic",
+                        delta_color="normal" if m_avg["is_biphasic"] else "off",
+                    )
+                    c3.metric(
+                        "1st-order R\u00b2 (averaged)",
+                        f"{m_avg['fo_R2']:.3f}" if not np.isnan(m_avg["fo_R2"]) else "N/A",
+                    )
+                    c4.metric(
+                        "C_peak\u2070 (averaged)",
+                        f"{m_avg['C_peak_0']:.1f} % Air Sat",
+                    )
+
+                    # Averaged profiles with ± 1 SD band
+                    st.markdown("---")
+                    t_start_avg = detect_diffusion_start(d_mean)
+                    t_min = (t_avg[t_start_avg:] - t_avg[t_start_avg]) / 60
+
+                    fig_avg, axes_avg = plt.subplots(1, 2, figsize=(14, 5))
+                    fig_avg.suptitle(
+                        f"Averaged Data (n = {n_ds} replicates, \u00b1 1 SD shading)",
+                        fontsize=12, fontweight="bold",
+                    )
+
+                    # Profile snapshots with SD bands
+                    ax = axes_avg[0]
+                    idx = np.linspace(0, len(t_min) - 1, 6, dtype=int)
+                    d_trim = d_mean[:, t_start_avg:]
+                    s_trim = d_std[:, t_start_avg:]
+                    for ii in idx:
+                        ax.plot(x_avg, d_trim[:, ii], lw=1.2,
+                                label=f"{t_min[ii]:.0f} min")
+                        ax.fill_between(
+                            x_avg,
+                            d_trim[:, ii] - s_trim[:, ii],
+                            d_trim[:, ii] + s_trim[:, ii],
+                            alpha=0.12,
+                        )
+                    ax.set_xlabel("Position (mm)")
+                    ax.set_ylabel("O\u2082 (% Air Sat)")
+                    ax.set_title("Mean profiles \u00b1 SD")
+                    ax.legend(fontsize=7, ncol=2)
+
+                    # Peak decay with SD band
+                    ax = axes_avg[1]
+                    pe_avg = m_avg["peak_excess"]
+                    # Approximate peak SD from std at peak pixel
+                    bl_avg = m_avg["baseline"]
+                    lo_a, hi_a = m_avg["centre_lo"], m_avg["centre_hi"]
+                    excess_std_centre = d_std[lo_a:hi_a, t_start_avg:].mean(axis=0)
+                    ax.plot(t_min, pe_avg, "o-", ms=3, lw=1.2, c="crimson",
+                            label="mean C_excess")
+                    ax.fill_between(t_min,
+                                    pe_avg - excess_std_centre,
+                                    pe_avg + excess_std_centre,
+                                    color="crimson", alpha=0.15,
+                                    label="\u00b1 1 SD")
+                    if not np.isnan(m_avg["tau_half_min"]):
+                        ax.axvline(m_avg["tau_half_min"], color="gray",
+                                   ls="--", lw=1,
+                                   label=f"\u03c4\u00bd = {m_avg['tau_half_min']:.1f} min")
+                    ax.set_xlabel("Time (min)")
+                    ax.set_ylabel("C_excess (% Air Sat)")
+                    ax.set_title("Peak decay (mean \u00b1 SD)")
+                    ax.legend(fontsize=8)
+
+                    plt.tight_layout()
+                    st.pyplot(fig_avg)
+                    buf = io.BytesIO()
+                    fig_avg.savefig(buf, format="png", dpi=180,
+                                    bbox_inches="tight")
+                    buf.seek(0)
+                    st.download_button("Download averaged plots (PNG)", buf,
+                                       "averaged_plots.png", "image/png",
+                                       key="dl_avg")
+                    plt.close(fig_avg)
+
+                    # Full 2x2 patent figure on averaged data
+                    st.markdown("---")
+                    st.markdown("### Patent metrics on averaged data")
+                    fig_pat = make_patent_figure(m_avg)
+                    st.pyplot(fig_pat)
+                    buf = io.BytesIO()
+                    fig_pat.savefig(buf, format="png", dpi=180,
+                                    bbox_inches="tight")
+                    buf.seek(0)
+                    st.download_button("Download avg. patent figure (PNG)", buf,
+                                       "avg_patent_metrics.png", "image/png",
+                                       key="dl_avg_pat")
+                    plt.close(fig_pat)
+
+                except Exception as e:
+                    st.error(f"Averaging failed: {e}")
+                    st.exception(e)
+            else:
+                st.warning(
+                    "Need at least 2 successfully parsed datasets to average."
+                )
+
+        # Summary tab
+        with tabs[n_files + 1]:
             if len(all_m) >= 2:
                 show_replicate_summary(all_m)
             else:
